@@ -1,0 +1,6 @@
+{
+  "name": "WL System - Controle de Estoque Galpão",
+  "description": "Sistema integrado de controle de estoque e inventário para galpão e distribuição DM Santos Empreendimentos com gestão de entradas, saídas, histórico e relatórios.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

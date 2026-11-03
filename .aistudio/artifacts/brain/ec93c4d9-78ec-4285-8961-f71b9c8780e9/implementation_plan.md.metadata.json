@@ -1,0 +1,6 @@
+{
+  "summary":  "Plano de implementação do novo Sistema de Gestão de Estoque Galpão (WL System / DM Santos Empreendimentos) em React, TypeScript e Tailwind CSS, com importação dos dados reais existentes, controle de acesso multi-nível e exportação de relatórios.",
+  "updatedAt":  "2026-10-29T17:24:33.402828933Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

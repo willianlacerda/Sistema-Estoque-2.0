@@ -1,50 +1,57 @@
 {
   "entities": {
-    "UserProfile": {
-      "title": "UserProfile",
-      "description": "Authenticated team member profile and access role (Admin or Operator) in WL System.",
+    "StaffAccount": {
+      "title": "StaffAccount",
+      "description": "Warehouse operator or administrator account synchronized across all devices.",
       "type": "object",
       "properties": {
-        "uid": {
+        "id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "Firebase Auth user UID matching the document ID."
+          "description": "Unique account document ID."
+        },
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
         },
         "username": {
           "type": "string",
           "minLength": 1,
           "maxLength": 100,
-          "description": "Display name shown in stock audit logs and user directory."
+          "description": "Login username."
         },
-        "email": {
+        "passwordHash": {
           "type": "string",
-          "format": "email",
-          "maxLength": 150,
-          "description": "Verified Google account email (PII - restricted to owner or admin)."
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Account access password managed by warehouse administrators."
         },
-        "role": {
+        "nivel": {
+          "type": "integer",
+          "enum": [1, 2],
+          "description": "Permission tier: 1 = Operador, 2 = Administrador."
+        },
+        "roleName": {
           "type": "string",
-          "enum": ["admin", "operator"],
-          "description": "Access control role determining inventory management permissions."
-        },
-        "active": {
-          "type": "boolean",
-          "description": "Whether the user account is currently authorized to operate in the warehouse."
+          "enum": ["Operador", "Administrador"],
+          "description": "Human-readable role label."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp of initial profile creation (immutable)."
+          "description": "Server timestamp of account creation (immutable)."
         },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp of most recent profile update."
+          "description": "Server timestamp of last account update."
         }
       },
-      "required": ["uid", "username", "email", "role", "active", "createdAt", "updatedAt"]
+      "required": ["id", "workspaceId", "username", "passwordHash", "nivel", "roleName", "createdAt", "updatedAt"]
     },
     "StockProduct": {
       "title": "StockProduct",
@@ -132,7 +139,7 @@
     },
     "StockMovement": {
       "title": "StockMovement",
-      "description": "Immutable stock movement audit entry (Entrada or Saída). Deletable only by admins.",
+      "description": "Immutable stock movement audit entry (Entrada or Saída).",
       "type": "object",
       "properties": {
         "id": {
@@ -184,14 +191,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 100,
-          "description": "Display name of the operator who recorded the movement."
-        },
-        "userId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "Firebase Auth UID of the user who recorded the movement."
+          "description": "Username of the operator who recorded the movement."
         },
         "saldoApos": {
           "type": "number",
@@ -217,7 +217,6 @@
         "tipo",
         "quantidade",
         "usuario",
-        "userId",
         "createdAt"
       ]
     },
@@ -316,26 +315,19 @@
           "type": "boolean",
           "description": "True once initial catalog has been imported into Firestore."
         },
-        "seededBy": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "UID of the administrator who seeded the catalog."
-        },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
           "description": "Server timestamp of bootstrap update."
         }
       },
-      "required": ["workspaceId", "seeded", "seededBy", "updatedAt"]
+      "required": ["workspaceId", "seeded", "updatedAt"]
     }
   },
   "firestore": {
-    "/users/{userId}": {
-      "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "Team member profiles and RBAC roles. PII isolated to owner and admins."
+    "/accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/StaffAccount" },
+      "description": "Shared warehouse staff login accounts."
     },
     "/products/{productId}": {
       "schema": { "$ref": "#/entities/StockProduct" },

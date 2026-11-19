@@ -43,7 +43,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
     addUser,
     updateUserPassword,
     updateUserLevel,
-    toggleUserActive,
     removeUser,
     exportBackupJson,
     importBackupJson,
@@ -462,63 +461,129 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
       )}
 
       {/* ============================================================== */}
-      {/* ABA: GERENCIAR USUÁRIOS & ACESSO NA NUVEM                      */}
+      {/* ABA: CRIAR E GERENCIAR USUÁRIOS (SINCRONIZADO NA NUVEM)        */}
       {/* ============================================================== */}
       {activeTab === 'usuarios' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Como adicionar novos membros (1 col) */}
+          {/* Formulário: Criar Novo Usuário (1 col) */}
           <div className="lg:col-span-1 bg-[#0f172a] p-6 rounded-3xl border border-slate-800 shadow-md space-y-5">
             <div className="border-b border-slate-800 pb-3 flex items-center justify-between">
               <h3 className="text-sm font-bold uppercase tracking-wider text-white flex items-center gap-2">
                 <UserPlus className="w-4 h-4 text-emerald-400" />
-                Acesso Compartilhado
+                Criar Novo Usuário
               </h3>
               <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                 Nuvem
               </span>
             </div>
 
-            <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
-              <p>
-                Qualquer membro da equipe pode acessar o estoque pelo celular ou computador entrando com a própria conta <strong>Google</strong>.
-              </p>
-              <div className="p-3.5 rounded-2xl bg-[#0b0f19] border border-slate-800 space-y-2">
-                <p className="font-bold text-white flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>Como funciona o acesso:</span>
-                </p>
-                <ol className="list-decimal list-inside space-y-1.5 text-[11px] text-slate-400">
-                  <li>Envie o link do aplicativo para a equipe.</li>
-                  <li>Cada pessoa entra clicando em <strong className="text-slate-200">Entrar com Google</strong>.</li>
-                  <li>Novos acessos entram automaticamente como <strong className="text-emerald-400">Operador (Nível 1)</strong>.</li>
-                  <li>Você pode promover para <strong className="text-amber-400">Administrador</strong> ou suspender o acesso a qualquer momento ao lado.</li>
-                </ol>
+            <p className="text-xs text-slate-400">
+              Cadastre operadores ou administradores para acessar o estoque de qualquer celular ou computador com login e senha.
+            </p>
+
+            <form onSubmit={handleAddUser} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
+                  Nome de Usuário (Login) *
+                </label>
+                <input
+                  type="text"
+                  value={newUsername}
+                  onChange={(e) => setNewUsername(e.target.value)}
+                  placeholder="Ex: marcos, juliana, operador1"
+                  className="w-full px-3.5 py-2.5 text-sm bg-[#0b0f19] border border-slate-700/80 rounded-xl focus:bg-[#111927] focus:outline-none focus:ring-2 focus:ring-emerald-500/40 text-white font-medium"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
+                  Senha de Acesso *
+                </label>
+                <div className="relative">
+                  <input
+                    type={showNewPassword ? 'text' : 'password'}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="Digite a senha"
+                    className="w-full pl-3.5 pr-10 py-2.5 text-sm bg-[#0b0f19] border border-slate-700/80 rounded-xl focus:bg-[#111927] focus:outline-none focus:ring-2 focus:ring-emerald-500/40 text-white font-medium"
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowNewPassword(!showNewPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 cursor-pointer p-1"
+                  >
+                    {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
+                  Nível de Permissão
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setNewLevel(1)}
+                    className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
+                      newLevel === 1
+                        ? 'bg-emerald-950/40 border-emerald-500/60 text-white ring-1 ring-emerald-500/30'
+                        : 'bg-[#0b0f19] border-slate-800 text-slate-400 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-white flex items-center justify-between">
+                      <span>Nível 1</span>
+                      {newLevel === 1 && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+                    </div>
+                    <div className="text-[11px] font-semibold text-emerald-400 mt-0.5">Operador</div>
+                    <div className="text-[10px] text-slate-500 mt-1 leading-tight">
+                      Entrada/Saída de mercadorias
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setNewLevel(2)}
+                    className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
+                      newLevel === 2
+                        ? 'bg-amber-950/40 border-amber-500/60 text-white ring-1 ring-amber-500/30'
+                        : 'bg-[#0b0f19] border-slate-800 text-slate-400 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-white flex items-center justify-between">
+                      <span>Nível 2</span>
+                      {newLevel === 2 && <CheckCircle2 className="w-3.5 h-3.5 text-amber-400" />}
+                    </div>
+                    <div className="text-[11px] font-semibold text-amber-400 mt-0.5">Administrador</div>
+                    <div className="text-[10px] text-slate-500 mt-1 leading-tight">
+                      Acesso total e gestão
+                    </div>
+                  </button>
+                </div>
               </div>
 
               <button
-                type="button"
-                onClick={() => {
-                  navigator.clipboard?.writeText(window.location.origin);
-                  showFeedback('Link do aplicativo copiado! Envie para sua equipe acessar.', 'success');
-                }}
-                className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+                type="submit"
+                className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer mt-4"
               >
-                <Users className="w-4 h-4" />
-                <span>Copiar Link para Enviar à Equipe</span>
+                <UserPlus className="w-4 h-4" />
+                <span>Salvar e Criar Usuário</span>
               </button>
-            </div>
+            </form>
           </div>
 
-          {/* Lista de Usuários Conectados (2 cols) */}
+          {/* Lista de Usuários Existentes (2 cols) */}
           <div className="lg:col-span-2 bg-[#0f172a] p-6 rounded-3xl border border-slate-800 shadow-md space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-3">
               <div>
                 <h3 className="text-sm font-bold uppercase tracking-wider text-white flex items-center gap-2">
                   <Users className="w-4 h-4 text-emerald-400" />
-                  Equipe com Acesso ({users.length})
+                  Usuários Ativos no Sistema ({users.length})
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Gerencie níveis de permissão, suspenda acessos ou remova membros em tempo real
+                  Gerencie permissões, altere senhas ou exclua acessos (sincronizado em tempo real)
                 </p>
               </div>
 
@@ -536,30 +601,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
 
             <div className="space-y-3">
               {users.map((u) => {
-                const userKey = u.uid || u.username;
-                const isCurrent = Boolean(
-                  (currentUser?.uid && u.uid === currentUser.uid) ||
-                    currentUser?.username === u.username
-                );
-                const isMasterAdmin =
-                  (u.email || '').toLowerCase() === 'wlsystemdm@gmail.com';
-                const isSuspended = u.active === false;
+                const isCurrent = currentUser?.username.toLowerCase() === u.username.toLowerCase();
+                const isMasterAdmin = u.username.toLowerCase() === 'willian';
+                const isEditingThisPassword = editingPasswordUser === u.username;
 
                 return (
                   <div
-                    key={userKey}
-                    className={`p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-colors ${
-                      isSuspended
-                        ? 'bg-[#0b0f19]/60 border-rose-900/50 opacity-80'
-                        : 'bg-[#0b0f19] border-slate-800 hover:border-slate-700/80'
-                    }`}
+                    key={u.uid || u.username}
+                    className="p-4 bg-[#0b0f19] rounded-2xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:border-slate-700/80 transition-colors"
                   >
-                    <div className="flex items-center gap-3 min-w-0">
+                    <div className="flex items-center gap-3">
                       <div
                         className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-sm shrink-0 ${
-                          isSuspended
-                            ? 'bg-rose-950 text-rose-300 border border-rose-800/80'
-                            : u.nivel === 2
+                          u.nivel === 2
                             ? 'bg-amber-950 text-amber-300 border border-amber-800/80'
                             : 'bg-slate-800 text-emerald-400 border border-slate-700'
                         }`}
@@ -567,9 +621,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
                         {u.username.slice(0, 2).toUpperCase()}
                       </div>
 
-                      <div className="min-w-0">
+                      <div>
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-bold text-white text-sm truncate">{u.username}</span>
+                          <span className="font-bold text-white text-sm">{u.username}</span>
                           {isMasterAdmin && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30 flex items-center gap-1">
                               <ShieldCheck className="w-3 h-3 text-amber-400" />
@@ -578,49 +632,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
                           )}
                           {isCurrent && !isMasterAdmin && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
-                              Você
+                              Sessão Atual
                             </span>
                           )}
-                          {isSuspended ? (
-                            <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-rose-950 text-rose-300 border border-rose-800/60">
-                              Suspenso
-                            </span>
-                          ) : (
-                            <span
-                              className={`text-xs px-2.5 py-0.5 rounded-full font-bold flex items-center gap-1 ${
-                                u.nivel === 2
-                                  ? 'bg-amber-950 text-amber-300 border border-amber-800/60'
-                                  : 'bg-slate-800 text-slate-300 border border-slate-700/60'
-                              }`}
-                            >
-                              {u.nivel === 2 && <ShieldCheck className="w-3 h-3 text-amber-400" />}
-                              {u.roleName}
-                            </span>
-                          )}
+                          <span
+                            className={`text-xs px-2.5 py-0.5 rounded-full font-bold flex items-center gap-1 ${
+                              u.nivel === 2
+                                ? 'bg-amber-950 text-amber-300 border border-amber-800/60'
+                                : 'bg-slate-800 text-slate-300 border border-slate-700/60'
+                            }`}
+                          >
+                            {u.nivel === 2 && <ShieldCheck className="w-3 h-3 text-amber-400" />}
+                            {u.roleName}
+                          </span>
                         </div>
 
-                        {u.email && (
-                          <div className="text-xs text-slate-400 mt-1 truncate font-mono">
-                            {u.email}
-                          </div>
-                        )}
+                        <div className="text-xs text-slate-500 mt-1 flex items-center gap-3 font-mono">
+                          <span>Senha salva: •••••• ({u.passwordHash})</span>
+                        </div>
                       </div>
                     </div>
 
-                    {/* Actions: Change Role, Suspend/Activate, Delete */}
-                    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap shrink-0">
+                    {/* Actions: Change Role, Edit Password, Delete */}
+                    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
                       <select
                         value={u.nivel}
                         disabled={!isAdmin || isCurrent || isMasterAdmin}
                         title={
                           !isAdmin
-                            ? 'Operadores não podem alterar o nível de outros usuários'
+                            ? 'Usuários Operadores não podem alterar o nível de outros usuários'
                             : isMasterAdmin
                             ? 'Administrador Principal (permanente)'
                             : 'Alterar nível de acesso'
                         }
                         onChange={(e) =>
-                          handleLevelChange(userKey, parseInt(e.target.value, 10) as UserLevel)
+                          handleLevelChange(u.username, parseInt(e.target.value, 10) as UserLevel)
                         }
                         className="text-xs font-semibold bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-slate-200 disabled:opacity-40 cursor-pointer focus:outline-none"
                       >
@@ -628,28 +674,50 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
                         <option value={2}>Nível 2 - Administrador</option>
                       </select>
 
-                      {isAdmin && !isCurrent && !isMasterAdmin && u.uid && (
+                      {isEditingThisPassword ? (
+                        <div className="flex items-center gap-1.5 bg-[#131d33] p-1 rounded-xl border border-slate-700">
+                          <input
+                            type="text"
+                            value={tempPassword}
+                            onChange={(e) => setTempPassword(e.target.value)}
+                            placeholder="Nova senha"
+                            className="w-24 px-2.5 py-1 text-xs border border-slate-600 rounded-lg bg-[#0b0f19] text-white focus:outline-none"
+                            autoFocus
+                          />
+                          <button
+                            onClick={() => handleSavePassword(u.username)}
+                            className="px-2.5 py-1 text-xs font-bold text-white bg-emerald-600 rounded-lg hover:bg-emerald-500 cursor-pointer"
+                          >
+                            Salvar
+                          </button>
+                          <button
+                            onClick={() => {
+                              setEditingPasswordUser(null);
+                              setTempPassword('');
+                            }}
+                            className="px-2 py-1 text-xs text-slate-400 hover:text-white cursor-pointer"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      ) : (
                         <button
-                          type="button"
                           onClick={() => {
-                            const res = toggleUserActive(u.uid!, isSuspended);
-                            showFeedback(res.message, res.success ? 'success' : 'error');
+                            setEditingPasswordUser(u.username);
+                            setTempPassword(u.passwordHash);
                           }}
-                          className={`px-3 py-2 text-xs font-bold rounded-xl border transition-colors cursor-pointer ${
-                            isSuspended
-                              ? 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60 hover:bg-emerald-900/60'
-                              : 'bg-slate-800 text-amber-300 border-slate-700 hover:bg-amber-950/50 hover:border-amber-800/60'
-                          }`}
+                          title="Alterar senha"
+                          className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-emerald-400 rounded-xl border border-slate-700 transition-colors cursor-pointer"
                         >
-                          {isSuspended ? 'Reativar' : 'Suspender'}
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Senha</span>
                         </button>
                       )}
 
                       {isAdmin && !isCurrent && !isMasterAdmin && (
                         <button
-                          type="button"
-                          onClick={() => handleDeleteUser(userKey)}
-                          title="Excluir registro do usuário"
+                          onClick={() => handleDeleteUser(u.username)}
+                          title="Excluir usuário"
                           className="p-2 text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 rounded-xl border border-transparent hover:border-rose-900/40 transition-colors cursor-pointer"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -663,7 +731,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ defaultSubTab = 'usu
 
             <div className="p-3 bg-[#0b0f19] rounded-xl border border-slate-800/80 text-[11px] text-slate-400 flex items-center justify-between">
               <span>
-                <strong>Segurança na Nuvem:</strong> Apenas <strong>Administradores</strong> podem promover cargos, suspender acessos, editar o catálogo ou excluir entradas do histórico.
+                <strong>Regra de Acesso:</strong> Apenas usuários com perfil <strong>Administrador</strong> podem criar/excluir usuários, alterar senhas e níveis de permissão.
               </span>
             </div>
           </div>

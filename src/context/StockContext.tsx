@@ -1,11 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import {
-  onAuthStateChanged,
-  signInWithPopup,
-  signOut,
-  User as FirebaseUser,
-} from 'firebase/auth';
-import {
   collection,
   doc,
   getDoc,
@@ -20,11 +14,8 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import {
-  auth,
   db,
-  googleProvider,
   WORKSPACE_ID,
-  BOOTSTRAP_ADMIN_EMAIL,
   OperationType,
   handleFirestoreError,
   BLUEPRINT_LIMITS,
@@ -36,6 +27,7 @@ import { StockProduct, StockMovement, UserAccount, UserLevel, SystemStats, Packa
 import {
   INITIAL_PRODUCTS,
   INITIAL_MOVEMENTS,
+  INITIAL_USERS,
   INITIAL_CATEGORIES,
   INITIAL_PACKAGING_TYPES,
   inferCategory,
@@ -63,9 +55,8 @@ interface StockContextType {
   packagingTypes: PackagingType[];
   stats: SystemStats;
   lastUpdatedTime: string;
-  signInWithGoogle: () => Promise<{ success: boolean; message?: string }>;
   login: (username: string, pass: string) => { success: boolean; message?: string };
-  logout: () => Promise<void>;
+  logout: () => void;
   registerMovement: (
     productId: string,
     tipo: 'Entrada' | 'Saída',
@@ -92,15 +83,16 @@ interface StockContextType {
   removePackagingType: (sigla: string) => { success: boolean; message: string };
   addUser: (username: string, pass: string, nivel: UserLevel) => { success: boolean; message: string };
   updateUserPassword: (username: string, newPass: string) => { success: boolean; message: string };
-  updateUserLevel: (identifier: string, newLevel: UserLevel) => { success: boolean; message: string };
-  toggleUserActive: (uid: string, active: boolean) => { success: boolean; message: string };
-  removeUser: (identifier: string) => { success: boolean; message: string };
+  updateUserLevel: (username: string, newLevel: UserLevel) => { success: boolean; message: string };
+  removeUser: (username: string) => { success: boolean; message: string };
   exportBackupJson: () => string;
   importBackupJson: (jsonString: string) => { success: boolean; message: string };
   resetDataToInitial: () => void;
 }
 
 const StockContext = createContext<StockContextType | undefined>(undefined);
+
+const LS_SESSION_KEY = 'wl_estoque_current_user_v3';
 
 function getNowFormatted(): string {
   const now = new Date();
@@ -112,22 +104,15 @@ function getNowFormatted(): string {
   return `${day}/${month}/${year} ${hours}:${minutes}`;
 }
 
-function formatTimestamp(ts: unknown): string {
-  if (ts instanceof Timestamp) {
-    const d = ts.toDate();
-    const day = String(d.getDate()).padStart(2, '0');
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const year = d.getFullYear();
-    return `${day}/${month}/${year}`;
-  }
-  return typeof ts === 'string' ? ts : '';
-}
-
 function parseBrDateToMs(dataHora: string): number {
   const match = dataHora.match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
   if (!match) return 0;
   const [, dd, mm, yyyy, hh = '00', min = '00'] = match;
   return new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(min)).getTime();
+}
+
+function makeAccountDocId(username: string): string {
+  return sanitizeDocId(`acc_${username.trim().toLowerCase()}`, 'acc');
 }
 
 function isUserAdmin(user: UserAccount | null): boolean {
@@ -136,28 +121,48 @@ function isUserAdmin(user: UserAccount | null): boolean {
     user.nivel === 2 ||
     Number(user.nivel) === 2 ||
     user.role === 'admin' ||
-    (user.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()
+    user.username.toLowerCase() === 'willian'
   );
 }
 
 export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [isAccessSuspended, setIsAccessSuspended] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(true);
   const [fatalError, setFatalError] = useState<Error | null>(null);
 
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
+    try {
+      const stored = localStorage.getItem(LS_SESSION_KEY);
+      if (stored) {
+        const parsed: UserAccount = JSON.parse(stored);
+        if (parsed && parsed.username) {
+          const isAdm =
+            parsed.username.toLowerCase() === 'willian' ||
+            parsed.username.toLowerCase() === 'admin' ||
+            Number(parsed.nivel) === 2;
+          return {
+            ...parsed,
+            nivel: (isAdm ? 2 : 1) as UserLevel,
+            roleName: isAdm ? 'Administrador' : 'Operador',
+            role: isAdm ? 'admin' : 'operator',
+          };
+        }
+      }
+    } catch (e) {
+      console.error('Failed to restore session', e);
+    }
+    return null;
+  });
+
+  const [users, setUsers] = useState<UserAccount[]>(INITIAL_USERS);
   const [products, setProducts] = useState<StockProduct[]>([]);
   const [movements, setMovements] = useState<StockMovement[]>([]);
-  const [users, setUsers] = useState<UserAccount[]>([]);
   const [categoryDocs, setCategoryDocs] = useState<CategoryDoc[]>([]);
   const [packagingDocs, setPackagingDocs] = useState<PackagingDoc[]>([]);
   const [lastUpdatedTime, setLastUpdatedTime] = useState<string>(getNowFormatted());
 
   const seedAttemptedRef = useRef(false);
 
-  // Surface any async Firestore permission errors cleanly to React ErrorBoundary
   if (fatalError) {
     throw fatalError;
   }
@@ -170,7 +175,21 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  // Derived string list of categories & packaging types
+  // Persist current logged-in session locally on this device
+  useEffect(() => {
+    try {
+      if (currentUser) {
+        localStorage.setItem(LS_SESSION_KEY, JSON.stringify(currentUser));
+        localStorage.setItem('wl_last_username', currentUser.username);
+      } else {
+        localStorage.removeItem(LS_SESSION_KEY);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, [currentUser]);
+
+  // Derived lists
   const categories = React.useMemo(() => {
     if (categoryDocs.length === 0) return INITIAL_CATEGORIES;
     return categoryDocs.map((c) => c.nome);
@@ -181,107 +200,29 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return packagingDocs.map((p) => ({ id: p.id, sigla: p.sigla, nome: p.nome }));
   }, [packagingDocs]);
 
-  // 1. Listen to Firebase Auth state and sync the user's profile doc in /users/{uid}
-  useEffect(() => {
-    let unsubProfile: (() => void) | null = null;
+  // Helper to seed initial accounts + products + movements + categories + packaging into Firestore once
+  const seedInitialDataToFirestore = async (includeAccounts: boolean = true) => {
+    const nowStr = getNowFormatted();
+    const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
 
-    const unsubAuth = onAuthStateChanged(auth, async (fbUser) => {
-      if (unsubProfile) {
-        unsubProfile();
-        unsubProfile = null;
-      }
-
-      setFirebaseUser(fbUser);
-
-      if (!fbUser) {
-        setCurrentUser(null);
-        setUsers([]);
-        setProducts([]);
-        setMovements([]);
-        setCategoryDocs([]);
-        setPackagingDocs([]);
-        setIsAccessSuspended(false);
-        setAuthReady(true);
-        return;
-      }
-
-      setIsSyncing(true);
-      const userPath = `users/${fbUser.uid}`;
-      const userDocRef = doc(db, 'users', fbUser.uid);
-      const emailLower = (fbUser.email || '').toLowerCase();
-      const isBootstrap = emailLower === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
-
-      try {
-        const snap = await getDoc(userDocRef);
-        if (!snap.exists()) {
-          const displayName = sanitizeString(
-            fbUser.displayName || (fbUser.email ? fbUser.email.split('@')[0] : 'Operador'),
-            BLUEPRINT_LIMITS.usernameMaxLength
-          );
-          await setDoc(userDocRef, {
-            uid: fbUser.uid,
-            username: displayName || 'Operador',
-            email: sanitizeString(fbUser.email || '', BLUEPRINT_LIMITS.emailMaxLength),
-            role: isBootstrap ? 'admin' : 'operator',
-            active: true,
+    if (includeAccounts) {
+      INITIAL_USERS.forEach((u) => {
+        const aid = makeAccountDocId(u.username);
+        const isAdm = u.nivel === 2 || u.username.toLowerCase() === 'willian';
+        operations.push((b) => {
+          b.set(doc(db, 'accounts', aid), {
+            id: aid,
+            workspaceId: WORKSPACE_ID,
+            username: sanitizeString(u.username, BLUEPRINT_LIMITS.usernameMaxLength),
+            passwordHash: sanitizeString(u.passwordHash, 128),
+            nivel: isAdm ? 2 : 1,
+            roleName: isAdm ? 'Administrador' : 'Operador',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
           });
-        } else if (isBootstrap && snap.data()?.role !== 'admin') {
-          await updateDoc(userDocRef, {
-            role: 'admin',
-            active: true,
-            updatedAt: serverTimestamp(),
-          });
-        }
-      } catch (err) {
-        reportAsyncError(err, OperationType.WRITE, userPath);
-        setAuthReady(true);
-        setIsSyncing(false);
-        return;
-      }
-
-      unsubProfile = onSnapshot(
-        userDocRef,
-        (docSnap) => {
-          if (docSnap.exists()) {
-            const data = docSnap.data();
-            const isAdm = isBootstrap || data.role === 'admin';
-            const active = isBootstrap ? true : data.active !== false;
-            setIsAccessSuspended(!active);
-            setCurrentUser({
-              uid: fbUser.uid,
-              username: data.username || fbUser.displayName || 'Operador',
-              email: data.email || fbUser.email || '',
-              passwordHash: '',
-              nivel: (isAdm ? 2 : 1) as UserLevel,
-              roleName: isAdm ? 'Administrador' : 'Operador',
-              role: isAdm ? 'admin' : 'operator',
-              active,
-              createdAt: formatTimestamp(data.createdAt),
-            });
-          }
-          setAuthReady(true);
-        },
-        (err) => {
-          reportAsyncError(err, OperationType.GET, userPath);
-          setAuthReady(true);
-        }
-      );
-    });
-
-    return () => {
-      if (unsubProfile) unsubProfile();
-      unsubAuth();
-    };
-  }, []);
-
-  // 2. Seed initial warehouse catalog once when an Admin signs in on a fresh database
-  const seedInitialDataToFirestore = async (uid: string) => {
-    const nowStr = getNowFormatted();
-
-    // Commit in safe batches (max 400 writes per batch)
-    const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
+        });
+      });
+    }
 
     const prodIdByNumber = new Map<number, string>();
     const prodIdByName = new Map<string, string>();
@@ -350,12 +291,9 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         tipo: m.tipo === 'Saída' ? 'Saída' : 'Entrada',
         quantidade: qty,
         usuario: sanitizeString(m.usuario || 'Sistema', BLUEPRINT_LIMITS.usernameMaxLength),
-        userId: uid,
         createdAt: serverTimestamp(),
       };
-      if (matchedProductId) {
-        movPayload.productId = matchedProductId;
-      }
+      if (matchedProductId) movPayload.productId = matchedProductId;
       if (m.observacao) {
         movPayload.observacao = sanitizeString(m.observacao, BLUEPRINT_LIMITS.observacaoMaxLength);
       }
@@ -366,10 +304,9 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
 
     operations.push((b) => {
-      b.set(doc(db, 'metadata', 'bootstrap'), {
+      b.set(doc(db, 'metadata', 'bootstrap_v2'), {
         workspaceId: WORKSPACE_ID,
         seeded: true,
-        seededBy: uid,
         updatedAt: serverTimestamp(),
       });
     });
@@ -382,28 +319,81 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
+  // 1. Seed Firestore once on first boot if database is empty, and subscribe to accounts live
   useEffect(() => {
-    if (!authReady || !firebaseUser || !currentUser || isAccessSuspended) return;
-    if (!isUserAdmin(currentUser) || seedAttemptedRef.current) return;
-
-    seedAttemptedRef.current = true;
-    const bootstrapRef = doc(db, 'metadata', 'bootstrap');
-
-    (async () => {
-      try {
-        const snap = await getDoc(bootstrapRef);
-        if (!snap.exists()) {
-          await seedInitialDataToFirestore(firebaseUser.uid);
+    if (!seedAttemptedRef.current) {
+      seedAttemptedRef.current = true;
+      (async () => {
+        try {
+          const metaSnap = await getDoc(doc(db, 'metadata', 'bootstrap_v2'));
+          if (!metaSnap.exists()) {
+            await seedInitialDataToFirestore(true);
+          }
+        } catch (err) {
+          reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap_v2');
         }
-      } catch (err) {
-        reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap');
-      }
-    })();
-  }, [authReady, firebaseUser, currentUser, isAccessSuspended]);
+      })();
+    }
 
-  // 3. Attach real-time Firestore onSnapshot listeners ONLY when auth is ready & user is active
+    const accountsQuery = query(
+      collection(db, 'accounts'),
+      where('workspaceId', '==', WORKSPACE_ID)
+    );
+
+    const unsubAccounts = onSnapshot(
+      accountsQuery,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: UserAccount[] = snapshot.docs.map((d) => {
+            const data = d.data();
+            const isAdm =
+              String(data.username || '').toLowerCase() === 'willian' ||
+              Number(data.nivel) === 2;
+            return {
+              uid: d.id,
+              username: String(data.username || ''),
+              passwordHash: String(data.passwordHash || ''),
+              nivel: (isAdm ? 2 : 1) as UserLevel,
+              roleName: isAdm ? 'Administrador' : 'Operador',
+              role: isAdm ? 'admin' : 'operator',
+              active: true,
+            };
+          });
+          list.sort((a, b) => {
+            if (b.nivel !== a.nivel) return b.nivel - a.nivel;
+            return a.username.localeCompare(b.username, 'pt-BR');
+          });
+          setUsers(list);
+
+          // Keep active session synchronized if role/password changed or account was removed
+          setCurrentUser((prev) => {
+            if (!prev) return null;
+            const live = list.find(
+              (u) => u.username.toLowerCase() === prev.username.toLowerCase()
+            );
+            if (!live) return null;
+            if (live.nivel !== prev.nivel || live.passwordHash !== prev.passwordHash) {
+              return live;
+            }
+            return prev;
+          });
+        }
+        setAuthReady(true);
+      },
+      (err) => {
+        reportAsyncError(err, OperationType.LIST, 'accounts');
+        setAuthReady(true);
+      }
+    );
+
+    return () => {
+      unsubAccounts();
+    };
+  }, []);
+
+  // 2. Real-time Firestore listeners for products, movements, categories, packagingTypes
   useEffect(() => {
-    if (!authReady || !firebaseUser || !currentUser || isAccessSuspended) {
+    if (!currentUser) {
       setIsSyncing(false);
       return;
     }
@@ -471,7 +461,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               tipo: (data.tipo === 'Saída' ? 'Saída' : 'Entrada') as 'Entrada' | 'Saída',
               quantidade: Number(data.quantidade) || 0,
               usuario: String(data.usuario || 'Operador'),
-              userId: data.userId,
               saldoApos: typeof data.saldoApos === 'number' ? data.saldoApos : undefined,
               observacao: data.observacao,
             } as StockMovement,
@@ -530,51 +519,13 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     );
 
-    // Only Admins subscribe to the /users directory (PII Isolation)
-    let unsubUsers: (() => void) | null = null;
-    if (isUserAdmin(currentUser)) {
-      unsubUsers = onSnapshot(
-        collection(db, 'users'),
-        (snapshot) => {
-          const list: UserAccount[] = snapshot.docs.map((d) => {
-            const data = d.data();
-            const isAdm =
-              data.role === 'admin' ||
-              String(data.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
-            return {
-              uid: d.id,
-              username: String(data.username || 'Usuário'),
-              email: String(data.email || ''),
-              passwordHash: '',
-              nivel: (isAdm ? 2 : 1) as UserLevel,
-              roleName: isAdm ? 'Administrador' : 'Operador',
-              role: isAdm ? 'admin' : 'operator',
-              active: data.active !== false,
-              createdAt: formatTimestamp(data.createdAt),
-            };
-          });
-          list.sort((a, b) => {
-            if (b.nivel !== a.nivel) return b.nivel - a.nivel;
-            return a.username.localeCompare(b.username, 'pt-BR');
-          });
-          setUsers(list);
-        },
-        (err) => {
-          reportAsyncError(err, OperationType.LIST, 'users');
-        }
-      );
-    } else {
-      setUsers([currentUser]);
-    }
-
     return () => {
       unsubProducts();
       unsubMovements();
       unsubCategories();
       unsubPackaging();
-      if (unsubUsers) unsubUsers();
     };
-  }, [authReady, firebaseUser?.uid, currentUser?.nivel, isAccessSuspended]);
+  }, [currentUser?.username]);
 
   // Derived system metrics
   const stats: SystemStats = React.useMemo(() => {
@@ -606,44 +557,39 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
   }, [products, movements]);
 
-  // Auth actions
-  const signInWithGoogle = async (): Promise<{ success: boolean; message?: string }> => {
-    try {
-      await signInWithPopup(auth, googleProvider);
-      return { success: true };
-    } catch (err: any) {
-      const code = err?.code || '';
-      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
-        return { success: false, message: 'Login cancelado. Clique novamente para entrar com sua conta Google.' };
-      }
-      if (code === 'auth/unauthorized-domain') {
-        return {
-          success: false,
-          message:
-            'Domínio ainda não autorizado no Firebase Authentication. Adicione este endereço em Authentication → Settings → Authorized domains no Console do Firebase.',
-        };
-      }
-      if (code === 'auth/popup-blocked') {
-        return {
-          success: false,
-          message: 'O navegador bloqueou a janela de login. Permita pop-ups para este site e tente novamente.',
-        };
-      }
-      return {
-        success: false,
-        message: err?.message || 'Não foi possível entrar com o Google. Tente novamente.',
+  // Classic Username + Password Login (synced against Firestore /accounts)
+  const login = (usernameInput: string, passInput: string): { success: boolean; message?: string } => {
+    const trimmedUser = usernameInput.trim();
+    const found = users.find(
+      (u) => u.username.toLowerCase() === trimmedUser.toLowerCase() && u.passwordHash === passInput
+    );
+    if (found) {
+      const isAdm =
+        found.username.toLowerCase() === 'willian' ||
+        found.username.toLowerCase() === 'admin' ||
+        Number(found.nivel) === 2;
+      const userToSet: UserAccount = {
+        ...found,
+        nivel: (isAdm ? 2 : 1) as UserLevel,
+        roleName: isAdm ? 'Administrador' : 'Operador',
+        role: isAdm ? 'admin' : 'operator',
+        active: true,
       };
+      setCurrentUser(userToSet);
+      return { success: true };
     }
+    return { success: false, message: 'Usuário ou senha incorretos.' };
   };
 
-  // Legacy signature kept for backward compatibility
-  const login = (): { success: boolean; message?: string } => {
-    return { success: false, message: 'Use o botão "Entrar com Google" para acessar o estoque na nuvem.' };
-  };
-
-  const logout = async () => {
-    seedAttemptedRef.current = false;
-    await signOut(auth);
+  const logout = () => {
+    if (currentUser?.username) {
+      try {
+        localStorage.setItem('wl_last_username', currentUser.username);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    setCurrentUser(null);
   };
 
   // =========================================================================
@@ -656,7 +602,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     quantidade: number,
     observacao?: string
   ): { success: boolean; message: string } => {
-    if (!auth.currentUser || !currentUser) {
+    if (!currentUser) {
       return { success: false, message: 'Sessão expirada. Faça login novamente.' };
     }
     if (quantidade <= 0 || isNaN(quantidade)) {
@@ -711,7 +657,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       tipo,
       quantidade: cleanQty,
       usuario: sanitizeString(currentUser.username, BLUEPRINT_LIMITS.usernameMaxLength),
-      userId: auth.currentUser.uid,
       saldoApos: novoSaldo,
       createdAt: serverTimestamp(),
     };
@@ -792,7 +737,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     unidade?: string,
     categoria?: string
   ): { success: boolean; message: string } => {
-    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+    if (!isUserAdmin(currentUser)) {
       return { success: false, message: 'Apenas administradores podem cadastrar novos produtos.' };
     }
 
@@ -801,8 +746,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return { success: false, message: 'Informe o nome do produto.' };
     }
 
-    const exists = products.some((p) => p.nome.toUpperCase() === cleanName);
-    if (exists) {
+    if (products.some((p) => p.nome.toUpperCase() === cleanName)) {
       return { success: false, message: `Já existe um produto cadastrado com o nome "${cleanName}".` };
     }
 
@@ -842,7 +786,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         tipo: 'Entrada',
         quantidade: initialQty,
         usuario: sanitizeString(currentUser?.username || 'Admin', BLUEPRINT_LIMITS.usernameMaxLength),
-        userId: auth.currentUser.uid,
         saldoApos: initialQty,
         observacao: 'Carga inicial de cadastro',
         createdAt: serverTimestamp(),
@@ -860,7 +803,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     id: string,
     updates: Partial<StockProduct>
   ): { success: boolean; message: string } => {
-    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+    if (!isUserAdmin(currentUser)) {
       return { success: false, message: 'Apenas administradores podem editar produtos.' };
     }
 
@@ -912,7 +855,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           tipo: diff > 0 ? 'Entrada' : 'Saída',
           quantidade: Math.abs(diff),
           usuario: sanitizeString(currentUser?.username || 'Admin', BLUEPRINT_LIMITS.usernameMaxLength),
-          userId: auth.currentUser.uid,
           saldoApos: nextQty,
           observacao: 'Ajuste manual de inventário',
           createdAt: serverTimestamp(),
@@ -1254,106 +1196,124 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
   };
 
-  // Users RBAC Management (Real Firebase Auth users in /users/{uid})
-  const addUser = (): { success: boolean; message: string } => {
-    return {
-      success: false,
-      message:
-        'Com o login Google na nuvem, novos membros apenas abrem o aplicativo e clicam em "Entrar com Google" para aparecerem nesta lista automaticamente.',
-    };
-  };
-
-  const updateUserPassword = (): { success: boolean; message: string } => {
-    return {
-      success: false,
-      message: 'As senhas são gerenciadas com segurança diretamente pela conta Google de cada usuário.',
-    };
-  };
-
-  const updateUserLevel = (identifier: string, newLevel: UserLevel): { success: boolean; message: string } => {
+  // Staff Accounts Management (Synced live in Firestore /accounts)
+  const addUser = (username: string, pass: string, nivel: UserLevel): { success: boolean; message: string } => {
     if (!isUserAdmin(currentUser)) {
-      return { success: false, message: 'Apenas administradores podem alterar permissões.' };
+      return { success: false, message: 'Apenas administradores podem cadastrar usuários.' };
     }
 
-    const target = users.find((u) => u.uid === identifier || u.username === identifier);
-    if (!target || !target.uid) {
+    const cleanUser = sanitizeString(username, BLUEPRINT_LIMITS.usernameMaxLength);
+    const cleanPass = sanitizeString(pass, 128);
+    if (!cleanUser || !cleanPass) {
+      return { success: false, message: 'Informe usuário e senha.' };
+    }
+    if (users.some((u) => u.username.toLowerCase() === cleanUser.toLowerCase())) {
+      return { success: false, message: `O usuário "${cleanUser}" já existe.` };
+    }
+
+    const aid = makeAccountDocId(cleanUser);
+    const isAdm = nivel === 2;
+    setDoc(doc(db, 'accounts', aid), {
+      id: aid,
+      workspaceId: WORKSPACE_ID,
+      username: cleanUser,
+      passwordHash: cleanPass,
+      nivel: isAdm ? 2 : 1,
+      roleName: isAdm ? 'Administrador' : 'Operador',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.CREATE, `accounts/${aid}`);
+    });
+
+    return {
+      success: true,
+      message: `Usuário "${cleanUser}" cadastrado e sincronizado na nuvem!`,
+    };
+  };
+
+  const updateUserPassword = (username: string, newPass: string): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem alterar senhas.' };
+    }
+
+    const cleanPass = sanitizeString(newPass, 128);
+    if (!cleanPass) {
+      return { success: false, message: 'A nova senha não pode ser vazia.' };
+    }
+
+    const target = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+    if (!target) {
       return { success: false, message: 'Usuário não encontrado.' };
     }
-    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
-      return { success: false, message: 'O Administrador Principal não pode ter seu nível alterado.' };
+
+    const aid = target.uid || makeAccountDocId(target.username);
+    updateDoc(doc(db, 'accounts', aid), {
+      passwordHash: cleanPass,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `accounts/${aid}`);
+    });
+
+    return { success: true, message: `Senha de "${target.username}" atualizada com sucesso!` };
+  };
+
+  const updateUserLevel = (username: string, newLevel: UserLevel): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem alterar níveis de acesso.' };
     }
-    if (target.uid === currentUser?.uid) {
+
+    const target = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+    if (!target) {
+      return { success: false, message: 'Usuário não encontrado.' };
+    }
+    if (target.username.toLowerCase() === 'willian') {
+      return { success: false, message: 'O Administrador Principal (Willian) não pode ser alterado.' };
+    }
+    if (target.username.toLowerCase() === currentUser?.username.toLowerCase()) {
       return { success: false, message: 'Você não pode alterar seu próprio nível de acesso.' };
     }
 
-    const newRole = newLevel === 2 ? 'admin' : 'operator';
-    updateDoc(doc(db, 'users', target.uid), {
-      role: newRole,
+    const aid = target.uid || makeAccountDocId(target.username);
+    const isAdm = newLevel === 2;
+    updateDoc(doc(db, 'accounts', aid), {
+      nivel: isAdm ? 2 : 1,
+      roleName: isAdm ? 'Administrador' : 'Operador',
       updatedAt: serverTimestamp(),
     }).catch((err) => {
-      reportAsyncError(err, OperationType.UPDATE, `users/${target.uid}`);
+      reportAsyncError(err, OperationType.UPDATE, `accounts/${aid}`);
     });
 
     return {
       success: true,
       message: `Permissão de "${target.username}" atualizada para ${
-        newLevel === 2 ? 'Administrador' : 'Operador'
+        isAdm ? 'Administrador' : 'Operador'
       }!`,
     };
   };
 
-  const toggleUserActive = (uid: string, active: boolean): { success: boolean; message: string } => {
+  const removeUser = (username: string): { success: boolean; message: string } => {
     if (!isUserAdmin(currentUser)) {
-      return { success: false, message: 'Apenas administradores podem suspender ou reativar acessos.' };
+      return { success: false, message: 'Apenas administradores podem excluir usuários.' };
     }
 
-    const target = users.find((u) => u.uid === uid);
+    const target = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
     if (!target) {
       return { success: false, message: 'Usuário não encontrado.' };
     }
-    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
-      return { success: false, message: 'Não é possível suspender o Administrador Principal.' };
+    if (target.username.toLowerCase() === 'willian') {
+      return { success: false, message: 'Não é possível excluir o Administrador Principal (Willian).' };
     }
-    if (target.uid === currentUser?.uid) {
-      return { success: false, message: 'Você não pode suspender sua própria conta.' };
-    }
-
-    updateDoc(doc(db, 'users', uid), {
-      active,
-      updatedAt: serverTimestamp(),
-    }).catch((err) => {
-      reportAsyncError(err, OperationType.UPDATE, `users/${uid}`);
-    });
-
-    return {
-      success: true,
-      message: active
-        ? `Acesso de "${target.username}" reativado com sucesso!`
-        : `Acesso de "${target.username}" suspenso imediatamente.`,
-    };
-  };
-
-  const removeUser = (identifier: string): { success: boolean; message: string } => {
-    if (!isUserAdmin(currentUser)) {
-      return { success: false, message: 'Apenas administradores podem remover usuários.' };
-    }
-
-    const target = users.find((u) => u.uid === identifier || u.username === identifier);
-    if (!target || !target.uid) {
-      return { success: false, message: 'Usuário não encontrado.' };
-    }
-    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
-      return { success: false, message: 'Não é possível excluir o Administrador Principal.' };
-    }
-    if (target.uid === currentUser?.uid) {
+    if (target.username.toLowerCase() === currentUser?.username.toLowerCase()) {
       return { success: false, message: 'Você não pode excluir o usuário logado atualmente.' };
     }
 
-    deleteDoc(doc(db, 'users', target.uid)).catch((err) => {
-      reportAsyncError(err, OperationType.DELETE, `users/${target.uid}`);
+    const aid = target.uid || makeAccountDocId(target.username);
+    deleteDoc(doc(db, 'accounts', aid)).catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `accounts/${aid}`);
     });
 
-    return { success: true, message: `Registro de "${target.username}" removido.` };
+    return { success: true, message: `Usuário "${target.username}" excluído com sucesso!` };
   };
 
   // Backup Export / Import / Reset
@@ -1373,7 +1333,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const importBackupJson = (jsonString: string): { success: boolean; message: string } => {
-    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+    if (!isUserAdmin(currentUser)) {
       return { success: false, message: 'Apenas administradores podem restaurar backups na nuvem.' };
     }
 
@@ -1421,10 +1381,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }));
       }
 
-      const uid = auth.currentUser.uid;
       const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
-
-      // Delete existing products & movements
       products.forEach((p) => operations.push((b) => b.delete(doc(db, 'products', p.id))));
       movements.forEach((m) => operations.push((b) => b.delete(doc(db, 'movements', m.id))));
 
@@ -1464,7 +1421,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           tipo: m.tipo === 'Saída' ? 'Saída' : 'Entrada',
           quantidade: Math.max(1, clampQuantity(m.quantidade)),
           usuario: sanitizeString(m.usuario || 'Backup', BLUEPRINT_LIMITS.usernameMaxLength),
-          userId: uid,
           createdAt: serverTimestamp(),
         };
         if (matchedProdId) movPayload.productId = matchedProdId;
@@ -1497,8 +1453,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const resetDataToInitial = () => {
-    if (!auth.currentUser || !isUserAdmin(currentUser)) return;
-    const uid = auth.currentUser.uid;
+    if (!isUserAdmin(currentUser)) return;
 
     (async () => {
       try {
@@ -1515,9 +1470,9 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           await batch.commit();
         }
 
-        await seedInitialDataToFirestore(uid);
+        await seedInitialDataToFirestore(false);
       } catch (err) {
-        reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap');
+        reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap_v2');
       }
     })();
   };
@@ -1531,12 +1486,11 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         currentUser,
         authReady,
         isSyncing,
-        isAccessSuspended,
+        isAccessSuspended: false,
         categories,
         packagingTypes,
         stats,
         lastUpdatedTime,
-        signInWithGoogle,
         login,
         logout,
         registerMovement,
@@ -1555,7 +1509,6 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         addUser,
         updateUserPassword,
         updateUserLevel,
-        toggleUserActive,
         removeUser,
         exportBackupJson,
         importBackupJson,

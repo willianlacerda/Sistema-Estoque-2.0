@@ -1,0 +1,328 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // 1. GLOBAL SAFETY NET (Default Deny)
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // 2. GLOBAL HARDENED PRIMITIVES
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isVerified() && request.auth.uid == userId;
+    }
+
+    // Bootstrapped Admin (verified email only - prevents email spoofing)
+    function isBootstrapAdmin() {
+      return isVerified() && request.auth.token.email == 'wlsystemdm@gmail.com';
+    }
+
+    // Role verified strictly against trusted /users/{uid} document
+    function isAdmin() {
+      return isBootstrapAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.active == true
+      );
+    }
+
+    // Active verified member (default active unless explicitly deactivated by admin)
+    function isActiveMember() {
+      return isBootstrapAdmin() || (
+        isVerified() && (
+          !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.active == true
+        )
+      );
+    }
+
+    // =========================================================================
+    // 3. VALIDATION BLUEPRINTS (Anti-Update-Gap & Schema Synchronicity)
+    // =========================================================================
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'username', 'email', 'role', 'active', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'username', 'email', 'role', 'active', 'createdAt', 'updatedAt']) &&
+        data.uid is string && data.uid == userId && isValidId(data.uid) &&
+        data.username is string && data.username.size() >= 1 && data.username.size() <= 100 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 150 &&
+        data.role in ['admin', 'operator'] &&
+        data.active is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll([
+          'id', 'workspaceId', 'numero', 'nome', 'quantidade',
+          'estoqueMinimo', 'unidade', 'categoria', 'ultimaAtualizacao',
+          'inativo', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'workspaceId', 'numero', 'nome', 'quantidade',
+          'estoqueMinimo', 'unidade', 'categoria', 'ultimaAtualizacao',
+          'inativo', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id == productId && isValidId(data.id) &&
+        data.workspaceId is string && data.workspaceId == 'dm-santos-central' && data.workspaceId.size() <= 40 &&
+        data.numero is int && data.numero >= 1 && data.numero <= 1000000 &&
+        data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 180 &&
+        data.quantidade is number && data.quantidade >= 0 && data.quantidade <= 100000000 &&
+        data.estoqueMinimo is number && data.estoqueMinimo >= 0 && data.estoqueMinimo <= 100000000 &&
+        data.unidade is string && data.unidade.size() >= 1 && data.unidade.size() <= 30 &&
+        data.categoria is string && data.categoria.size() >= 1 && data.categoria.size() <= 60 &&
+        data.ultimaAtualizacao is string && data.ultimaAtualizacao.size() >= 1 && data.ultimaAtualizacao.size() <= 40 &&
+        data.inativo is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMovement(data, movementId) {
+      return data.keys().hasAll([
+          'id', 'workspaceId', 'dataHora', 'numero', 'produto',
+          'tipo', 'quantidade', 'usuario', 'userId', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'workspaceId', 'productId', 'dataHora', 'numero', 'produto',
+          'tipo', 'quantidade', 'usuario', 'userId', 'saldoApos', 'observacao', 'createdAt'
+        ]) &&
+        data.id is string && data.id == movementId && isValidId(data.id) &&
+        data.workspaceId is string && data.workspaceId == 'dm-santos-central' && data.workspaceId.size() <= 40 &&
+        (!('productId' in data) || (data.productId is string && isValidId(data.productId))) &&
+        data.dataHora is string && data.dataHora.size() >= 1 && data.dataHora.size() <= 40 &&
+        data.numero is int && data.numero >= 1 && data.numero <= 1000000 &&
+        data.produto is string && data.produto.size() >= 1 && data.produto.size() <= 180 &&
+        data.tipo in ['Entrada', 'Saída'] &&
+        data.quantidade is number && data.quantidade > 0 && data.quantidade <= 100000000 &&
+        data.usuario is string && data.usuario.size() >= 1 && data.usuario.size() <= 100 &&
+        data.userId is string && data.userId == request.auth.uid && isValidId(data.userId) &&
+        (!('saldoApos' in data) || (data.saldoApos is number && data.saldoApos >= 0 && data.saldoApos <= 100000000)) &&
+        (!('observacao' in data) || (data.observacao is string && data.observacao.size() <= 300)) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidCategory(data, categoryId) {
+      return data.keys().hasAll(['id', 'workspaceId', 'nome', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'workspaceId', 'nome', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id == categoryId && isValidId(data.id) &&
+        data.workspaceId is string && data.workspaceId == 'dm-santos-central' && data.workspaceId.size() <= 40 &&
+        data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 60 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPackaging(data, packagingId) {
+      return data.keys().hasAll(['id', 'workspaceId', 'sigla', 'nome', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'workspaceId', 'sigla', 'nome', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id == packagingId && isValidId(data.id) &&
+        data.workspaceId is string && data.workspaceId == 'dm-santos-central' && data.workspaceId.size() <= 40 &&
+        data.sigla is string && data.sigla.size() >= 1 && data.sigla.size() <= 20 &&
+        data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 60 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMetadata(data) {
+      return data.keys().hasAll(['workspaceId', 'seeded', 'seededBy', 'updatedAt']) &&
+        data.keys().hasOnly(['workspaceId', 'seeded', 'seededBy', 'updatedAt']) &&
+        data.workspaceId is string && data.workspaceId == 'dm-santos-central' && data.workspaceId.size() <= 40 &&
+        data.seeded is bool &&
+        data.seededBy is string && data.seededBy == request.auth.uid && isValidId(data.seededBy) &&
+        data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // 4. COLLECTION RULES
+    // =========================================================================
+
+    // Users Collection (PII isolated to owner or admin; strict anti-privilege-escalation)
+    match /users/{userId} {
+      allow get: if isVerified() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isVerified() && (
+        isBootstrapAdmin() ||
+        resource.data.uid == request.auth.uid ||
+        isAdmin()
+      );
+
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        isOwner(userId) &&
+        incoming().email == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().active == true &&
+        (
+          (isBootstrapAdmin() && incoming().role == 'admin') ||
+          (!isBootstrapAdmin() && incoming().role == 'operator')
+        );
+
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Admin managing team member roles and activation
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'active', 'username', 'updatedAt'])) ||
+          // Action 2: Owner updating own display name only
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['username', 'updatedAt']))
+        );
+
+      allow delete: if isVerified() && isValidId(userId) && isAdmin() && userId != request.auth.uid;
+    }
+
+    // Products Collection (Shared warehouse catalog)
+    match /products/{productId} {
+      allow get: if isVerified() && isValidId(productId) && existing().workspaceId == 'dm-santos-central' && isActiveMember();
+      allow list: if isVerified() && resource.data.workspaceId == 'dm-santos-central';
+
+      allow create: if isVerified() &&
+        isValidId(productId) &&
+        isValidProduct(incoming(), productId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow update: if isVerified() &&
+        isValidId(productId) &&
+        isValidProduct(incoming(), productId) &&
+        incoming().id == existing().id &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Admin full catalog update
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'numero', 'nome', 'quantidade', 'estoqueMinimo', 'unidade',
+            'categoria', 'ultimaAtualizacao', 'inativo', 'updatedAt'
+          ])) ||
+          // Action 2: Active Operator stock movement (Entrada / Saída / auto-reactivation)
+          (isActiveMember() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'quantidade', 'ultimaAtualizacao', 'inativo', 'updatedAt'
+          ]))
+        );
+
+      allow delete: if isVerified() && isValidId(productId) && isAdmin();
+    }
+
+    // Movements Collection (Immutable audit log; Admin-only deletion)
+    match /movements/{movementId} {
+      allow get: if isVerified() && isValidId(movementId) && existing().workspaceId == 'dm-santos-central' && isActiveMember();
+      allow list: if isVerified() && resource.data.workspaceId == 'dm-santos-central';
+
+      allow create: if isVerified() &&
+        isValidId(movementId) &&
+        isValidMovement(incoming(), movementId) &&
+        incoming().createdAt == request.time &&
+        isActiveMember() &&
+        (!('productId' in incoming()) || existsAfter(/databases/$(database)/documents/products/$(incoming().productId)));
+
+      // Audit logs are strictly immutable
+      allow update: if false;
+
+      // Only administrators may delete movement history entries
+      allow delete: if isVerified() && isValidId(movementId) && isAdmin();
+    }
+
+    // Categories Collection (Shared catalog categories; Admin-managed)
+    match /categories/{categoryId} {
+      allow get: if isVerified() && isValidId(categoryId) && existing().workspaceId == 'dm-santos-central' && isActiveMember();
+      allow list: if isVerified() && resource.data.workspaceId == 'dm-santos-central';
+
+      allow create: if isVerified() &&
+        isValidId(categoryId) &&
+        isValidCategory(incoming(), categoryId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow update: if isVerified() &&
+        isValidId(categoryId) &&
+        isValidCategory(incoming(), categoryId) &&
+        incoming().id == existing().id &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isAdmin() &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['nome', 'updatedAt']);
+
+      allow delete: if isVerified() && isValidId(categoryId) && isAdmin();
+    }
+
+    // Packaging Types Collection (Shared unit definitions; Admin-managed)
+    match /packagingTypes/{packagingId} {
+      allow get: if isVerified() && isValidId(packagingId) && existing().workspaceId == 'dm-santos-central' && isActiveMember();
+      allow list: if isVerified() && resource.data.workspaceId == 'dm-santos-central';
+
+      allow create: if isVerified() &&
+        isValidId(packagingId) &&
+        isValidPackaging(incoming(), packagingId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow update: if isVerified() &&
+        isValidId(packagingId) &&
+        isValidPackaging(incoming(), packagingId) &&
+        incoming().id == existing().id &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isAdmin() &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['sigla', 'nome', 'updatedAt']);
+
+      allow delete: if isVerified() && isValidId(packagingId) && isAdmin();
+    }
+
+    // Workspace Bootstrap Metadata
+    match /metadata/{docId} {
+      allow get: if isVerified() && isValidId(docId) && isActiveMember();
+      allow list: if false;
+
+      allow create: if isVerified() &&
+        isValidId(docId) &&
+        isValidMetadata(incoming()) &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow update: if isVerified() &&
+        isValidId(docId) &&
+        isValidMetadata(incoming()) &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().updatedAt == request.time &&
+        isAdmin() &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['seeded', 'seededBy', 'updatedAt']);
+
+      allow delete: if false;
+    }
+  }
+}

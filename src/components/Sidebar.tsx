@@ -88,15 +88,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <img
-              src="/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png"
+              src="/logo.png"
               alt="WL System Logo"
               className="h-11 w-11 object-contain filter drop-shadow-md shrink-0 select-none"
-              onError={(e) => {
-                const target = e.target as HTMLImageElement;
-                if (!target.src.includes('Emblema_circular_verde_e_amarelo_recortado_851a632b.png')) {
-                  target.src = '/public/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
-                }
-              }}
             />
             <div>
               <div className="flex items-center gap-1.5">

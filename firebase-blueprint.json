@@ -1,0 +1,361 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated team member profile and access role (Admin or Operator) in WL System.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth user UID matching the document ID."
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Display name shown in stock audit logs and user directory."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 150,
+          "description": "Verified Google account email (PII - restricted to owner or admin)."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "operator"],
+          "description": "Access control role determining inventory management permissions."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether the user account is currently authorized to operate in the warehouse."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of initial profile creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of most recent profile update."
+        }
+      },
+      "required": ["uid", "username", "email", "role", "active", "createdAt", "updatedAt"]
+    },
+    "StockProduct": {
+      "title": "StockProduct",
+      "description": "Warehouse inventory product record synchronized across all connected devices.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique document ID for the product."
+        },
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
+        },
+        "numero": {
+          "type": "integer",
+          "description": "Sequential product catalog number."
+        },
+        "nome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Uppercase product description."
+        },
+        "quantidade": {
+          "type": "number",
+          "description": "Current stock balance in warehouse."
+        },
+        "estoqueMinimo": {
+          "type": "number",
+          "description": "Low-stock alert threshold."
+        },
+        "unidade": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 30,
+          "description": "Packaging unit abbreviation (e.g., CX, FARDO, UN)."
+        },
+        "categoria": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Product category name."
+        },
+        "ultimaAtualizacao": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Formatted display timestamp (dd/MM/yyyy HH:mm)."
+        },
+        "inativo": {
+          "type": "boolean",
+          "description": "Whether the product is archived/inactive."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of product creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last product update."
+        }
+      },
+      "required": [
+        "id",
+        "workspaceId",
+        "numero",
+        "nome",
+        "quantidade",
+        "estoqueMinimo",
+        "unidade",
+        "categoria",
+        "ultimaAtualizacao",
+        "inativo",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Immutable stock movement audit entry (Entrada or Saída). Deletable only by admins.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique movement document ID."
+        },
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
+        },
+        "productId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Optional reference to the product document ID in /products."
+        },
+        "dataHora": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Formatted timestamp string (dd/MM/yyyy HH:mm)."
+        },
+        "numero": {
+          "type": "integer",
+          "description": "Product catalog number at movement time."
+        },
+        "produto": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Product name snapshot at movement time."
+        },
+        "tipo": {
+          "type": "string",
+          "enum": ["Entrada", "Saída"],
+          "description": "Movement direction."
+        },
+        "quantidade": {
+          "type": "number",
+          "description": "Positive quantity moved."
+        },
+        "usuario": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Display name of the operator who recorded the movement."
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user who recorded the movement."
+        },
+        "saldoApos": {
+          "type": "number",
+          "description": "Optional resulting product balance after movement."
+        },
+        "observacao": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Optional movement note."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of movement creation (immutable)."
+        }
+      },
+      "required": [
+        "id",
+        "workspaceId",
+        "dataHora",
+        "numero",
+        "produto",
+        "tipo",
+        "quantidade",
+        "usuario",
+        "userId",
+        "createdAt"
+      ]
+    },
+    "CategoryItem": {
+      "title": "CategoryItem",
+      "description": "Product category managed by administrators.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Category document ID."
+        },
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
+        },
+        "nome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Category display name."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": ["id", "workspaceId", "nome", "createdAt", "updatedAt"]
+    },
+    "PackagingItem": {
+      "title": "PackagingItem",
+      "description": "Packaging unit type managed by administrators.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Packaging type document ID."
+        },
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
+        },
+        "sigla": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "description": "Uppercase short code (e.g., CX, FARDO, UN)."
+        },
+        "nome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Human-readable packaging name."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": ["id", "workspaceId", "sigla", "nome", "createdAt", "updatedAt"]
+    },
+    "WorkspaceMeta": {
+      "title": "WorkspaceMeta",
+      "description": "Bootstrap state tracking initial warehouse catalog seeding.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "enum": ["dm-santos-central"],
+          "maxLength": 40,
+          "description": "Shared warehouse workspace identifier."
+        },
+        "seeded": {
+          "type": "boolean",
+          "description": "True once initial catalog has been imported into Firestore."
+        },
+        "seededBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the administrator who seeded the catalog."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of bootstrap update."
+        }
+      },
+      "required": ["workspaceId", "seeded", "seededBy", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Team member profiles and RBAC roles. PII isolated to owner and admins."
+    },
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/StockProduct" },
+      "description": "Shared warehouse inventory catalog."
+    },
+    "/movements/{movementId}": {
+      "schema": { "$ref": "#/entities/StockMovement" },
+      "description": "Shared immutable stock movement audit log."
+    },
+    "/categories/{categoryId}": {
+      "schema": { "$ref": "#/entities/CategoryItem" },
+      "description": "Shared product categories."
+    },
+    "/packagingTypes/{packagingId}": {
+      "schema": { "$ref": "#/entities/PackagingItem" },
+      "description": "Shared packaging unit definitions."
+    },
+    "/metadata/{docId}": {
+      "schema": { "$ref": "#/entities/WorkspaceMeta" },
+      "description": "Workspace bootstrap metadata."
+    }
+  }
+}

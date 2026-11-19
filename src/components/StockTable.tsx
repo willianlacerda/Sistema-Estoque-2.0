@@ -55,10 +55,7 @@ export const StockTable: React.FC<StockTableProps> = ({
   };
 
   const canManageProducts = Boolean(
-    currentUser &&
-      (currentUser.nivel === 2 ||
-        Number(currentUser.nivel) === 2 ||
-        currentUser.username.toLowerCase() === 'willian')
+    currentUser && (currentUser.nivel === 2 || Number(currentUser.nivel) === 2 || currentUser.role === 'admin')
   );
   const canDeleteProducts = canManageProducts;
 

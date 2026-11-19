@@ -5,14 +5,19 @@
 export type UserLevel = 1 | 2;
 
 export interface UserAccount {
+  uid?: string;
   username: string;
-  passwordHash: string; // Plaintext or hashed for this system
+  email?: string;
+  passwordHash: string;
   nivel: UserLevel;
   roleName: 'Operador' | 'Administrador';
+  role?: 'admin' | 'operator';
+  active?: boolean;
   createdAt?: string;
 }
 
 export interface PackagingType {
+  id?: string;
   sigla: string; // ex: 'FARDO', 'CX', 'SACO', 'GARRAFA', 'UN', 'LATA', 'BALDE'
   nome: string;  // ex: 'Caixa (CX)', 'Fardo', 'Saco', etc.
 }
@@ -33,12 +38,14 @@ export type MovementType = 'Entrada' | 'Saída';
 
 export interface StockMovement {
   id: string;
+  productId?: string;
   dataHora: string;
   numero: number;
   produto: string;
   tipo: MovementType;
   quantidade: number;
   usuario: string;
+  userId?: string;
   saldoApos?: number;
   observacao?: string;
 }

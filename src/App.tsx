@@ -16,11 +16,12 @@ import { SettingsView } from './components/SettingsView';
 import { ReportsView } from './components/ReportsView';
 import { MovementModal } from './components/MovementModal';
 import { ProductFormModal } from './components/ProductFormModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { StockProduct, MovementType } from './types';
-import { Boxes, History, PackagePlus, FileSpreadsheet, Settings } from 'lucide-react';
+import { Boxes, History, PackagePlus, FileSpreadsheet, Settings, Loader2, ShieldAlert, LogOut } from 'lucide-react';
 
 function MainApp() {
-  const { currentUser, lastUpdatedTime, stats } = useStock();
+  const { currentUser, authReady, isAccessSuspended, logout, lastUpdatedTime, stats } = useStock();
 
   // Navigation tab state: 'estoque' | 'historico' | 'relatorios' | 'cadastro' | 'configuracoes'
   const [activeTab, setActiveTab] = useState<SidebarTab>('estoque');
@@ -45,9 +46,48 @@ function MainApp() {
     setActiveTab('configuracoes');
   };
 
-  // If user is not authenticated, show Login Screen
+  // Loading state while verifying Firebase session
+  if (!authReady) {
+    return (
+      <div className="min-h-screen bg-[#0b0f19] text-slate-100 flex flex-col items-center justify-center p-6 gap-4">
+        <img src="/logo.png" alt="WL System" className="h-16 w-16 object-contain opacity-90" />
+        <div className="flex items-center gap-2.5 text-sm font-semibold text-slate-300">
+          <Loader2 className="w-5 h-5 animate-spin text-emerald-400" />
+          <span>Conectando ao estoque na nuvem...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // If user is not authenticated, show Google Login Screen
   if (!currentUser) {
     return <LoginView />;
+  }
+
+  // If user access was suspended by an administrator
+  if (isAccessSuspended) {
+    return (
+      <div className="min-h-screen bg-[#0b0f19] text-slate-100 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-[#0f172a] border border-slate-800 rounded-3xl p-8 text-center space-y-5 shadow-2xl">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-400">
+            <ShieldAlert className="w-7 h-7" />
+          </div>
+          <div>
+            <h2 className="text-lg font-extrabold text-white">Acesso Suspenso</h2>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+              Sua conta (<strong className="text-slate-200">{currentUser.email || currentUser.username}</strong>) foi desativada temporariamente pelo Administrador do galpão.
+            </p>
+          </div>
+          <button
+            onClick={() => logout()}
+            className="w-full py-3 px-4 bg-slate-800 hover:bg-slate-700 text-white font-bold text-sm rounded-xl inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+            <span>Sair da Conta</span>
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -215,8 +255,10 @@ function MainApp() {
 
 export default function App() {
   return (
-    <StockProvider>
-      <MainApp />
-    </StockProvider>
+    <ErrorBoundary>
+      <StockProvider>
+        <MainApp />
+      </StockProvider>
+    </ErrorBoundary>
   );
 }

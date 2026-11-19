@@ -108,15 +108,9 @@ export const ReportPrintModal: React.FC<ReportPrintModalProps> = ({
             <div className="bg-[#2e7d32] text-white p-4 sm:p-5 rounded-t-lg print:rounded-none flex items-center justify-between mb-4">
               <div className="flex items-center gap-3">
                 <img
-                  src="/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png"
+                  src="/logo.png"
                   alt="WL Logo"
                   className="h-10 w-10 object-contain drop-shadow-sm shrink-0"
-                  onError={(e) => {
-                    const target = e.target as HTMLImageElement;
-                    if (!target.src.includes('Emblema_circular_verde_e_amarelo_recortado_851a632b.png')) {
-                      target.src = '/public/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
-                    }
-                  }}
                 />
                 <div>
                   <h1 className="text-xl sm:text-2xl font-bold tracking-tight">

@@ -1,0 +1,8 @@
+node_modules
+dist
+.aistudio
+.env
+.env.*
+!.env.example
+bun.lock
+public/assets/aistudio

@@ -24,15 +24,9 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Logo & Company Title */}
           <div className="flex items-center gap-4">
             <img
-              src="/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png"
+              src="/logo.png"
               alt="WL Logo"
               className="h-12 w-12 object-contain shrink-0"
-              onError={(e) => {
-                const target = e.target as HTMLImageElement;
-                if (!target.src.includes('Emblema_circular_verde_e_amarelo_recortado_851a632b.png')) {
-                  target.src = '/public/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
-                }
-              }}
             />
             <div>
               <div className="flex items-center gap-2">

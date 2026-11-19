@@ -28,11 +28,7 @@ export const MovementHistoryTable: React.FC = () => {
 
   // Check if current user has administrator privileges
   const canDeleteMovement = Boolean(
-    currentUser &&
-      (currentUser.nivel === 2 ||
-        Number(currentUser.nivel) === 2 ||
-        currentUser.username.toLowerCase() === 'willian' ||
-        currentUser.username.toLowerCase() === 'admin')
+    currentUser && (currentUser.nivel === 2 || Number(currentUser.nivel) === 2 || currentUser.role === 'admin')
   );
 
   const showToast = (text: string, type: 'success' | 'error' = 'success') => {

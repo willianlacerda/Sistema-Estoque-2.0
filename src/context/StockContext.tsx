@@ -1,29 +1,85 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  User as FirebaseUser,
+} from 'firebase/auth';
+import {
+  collection,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  where,
+  writeBatch,
+  serverTimestamp,
+  Timestamp,
+} from 'firebase/firestore';
+import {
+  auth,
+  db,
+  googleProvider,
+  WORKSPACE_ID,
+  BOOTSTRAP_ADMIN_EMAIL,
+  OperationType,
+  handleFirestoreError,
+  BLUEPRINT_LIMITS,
+  sanitizeString,
+  sanitizeDocId,
+  clampQuantity,
+} from '../firebase';
 import { StockProduct, StockMovement, UserAccount, UserLevel, SystemStats, PackagingType } from '../types';
 import {
   INITIAL_PRODUCTS,
   INITIAL_MOVEMENTS,
-  INITIAL_USERS,
   INITIAL_CATEGORIES,
   INITIAL_PACKAGING_TYPES,
   inferCategory,
   inferUnit,
 } from '../data/initialData';
 
+interface CategoryDoc {
+  id: string;
+  nome: string;
+}
+
+interface PackagingDoc extends PackagingType {
+  id: string;
+}
+
 interface StockContextType {
   products: StockProduct[];
   movements: StockMovement[];
   users: UserAccount[];
   currentUser: UserAccount | null;
+  authReady: boolean;
+  isSyncing: boolean;
+  isAccessSuspended: boolean;
   categories: string[];
   packagingTypes: PackagingType[];
   stats: SystemStats;
   lastUpdatedTime: string;
+  signInWithGoogle: () => Promise<{ success: boolean; message?: string }>;
   login: (username: string, pass: string) => { success: boolean; message?: string };
-  logout: () => void;
-  registerMovement: (productId: string, tipo: 'Entrada' | 'Saída', quantidade: number, observacao?: string) => { success: boolean; message: string };
+  logout: () => Promise<void>;
+  registerMovement: (
+    productId: string,
+    tipo: 'Entrada' | 'Saída',
+    quantidade: number,
+    observacao?: string
+  ) => { success: boolean; message: string };
   removeMovement: (id: string, revertStock?: boolean) => { success: boolean; message: string };
-  addProduct: (nome: string, quantidadeInicial: number, estoqueMinimo?: number, unidade?: string, categoria?: string) => { success: boolean; message: string };
+  addProduct: (
+    nome: string,
+    quantidadeInicial: number,
+    estoqueMinimo?: number,
+    unidade?: string,
+    categoria?: string
+  ) => { success: boolean; message: string };
   updateProduct: (id: string, updates: Partial<StockProduct>) => { success: boolean; message: string };
   removeProduct: (id: string) => { success: boolean; message: string };
   inactivateProduct: (id: string) => { success: boolean; message: string };
@@ -36,21 +92,15 @@ interface StockContextType {
   removePackagingType: (sigla: string) => { success: boolean; message: string };
   addUser: (username: string, pass: string, nivel: UserLevel) => { success: boolean; message: string };
   updateUserPassword: (username: string, newPass: string) => { success: boolean; message: string };
-  updateUserLevel: (username: string, newLevel: UserLevel) => { success: boolean; message: string };
-  removeUser: (username: string) => { success: boolean; message: string };
+  updateUserLevel: (identifier: string, newLevel: UserLevel) => { success: boolean; message: string };
+  toggleUserActive: (uid: string, active: boolean) => { success: boolean; message: string };
+  removeUser: (identifier: string) => { success: boolean; message: string };
   exportBackupJson: () => string;
   importBackupJson: (jsonString: string) => { success: boolean; message: string };
   resetDataToInitial: () => void;
 }
 
 const StockContext = createContext<StockContextType | undefined>(undefined);
-
-const LS_PRODUCTS_KEY = 'wl_estoque_produtos_v2';
-const LS_MOVEMENTS_KEY = 'wl_estoque_historico_v2';
-const LS_USERS_KEY = 'wl_estoque_usuarios_v2';
-const LS_CURRENT_USER_KEY = 'wl_estoque_current_user_v2';
-const LS_CATEGORIES_KEY = 'wl_estoque_categorias_v2';
-const LS_PACKAGING_KEY = 'wl_estoque_embalagens_v2';
 
 function getNowFormatted(): string {
   const now = new Date();
@@ -62,169 +112,469 @@ function getNowFormatted(): string {
   return `${day}/${month}/${year} ${hours}:${minutes}`;
 }
 
+function formatTimestamp(ts: unknown): string {
+  if (ts instanceof Timestamp) {
+    const d = ts.toDate();
+    const day = String(d.getDate()).padStart(2, '0');
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const year = d.getFullYear();
+    return `${day}/${month}/${year}`;
+  }
+  return typeof ts === 'string' ? ts : '';
+}
+
+function parseBrDateToMs(dataHora: string): number {
+  const match = dataHora.match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (!match) return 0;
+  const [, dd, mm, yyyy, hh = '00', min = '00'] = match;
+  return new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(min)).getTime();
+}
+
+function isUserAdmin(user: UserAccount | null): boolean {
+  if (!user) return false;
+  return (
+    user.nivel === 2 ||
+    Number(user.nivel) === 2 ||
+    user.role === 'admin' ||
+    (user.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()
+  );
+}
+
 export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [products, setProducts] = useState<StockProduct[]>(() => {
-    try {
-      const stored = localStorage.getItem(LS_PRODUCTS_KEY);
-      if (stored) return JSON.parse(stored);
-    } catch (e) {
-      console.error('Failed to load products from localStorage', e);
-    }
-    return INITIAL_PRODUCTS;
-  });
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isAccessSuspended, setIsAccessSuspended] = useState(false);
+  const [fatalError, setFatalError] = useState<Error | null>(null);
 
-  const [movements, setMovements] = useState<StockMovement[]>(() => {
-    try {
-      const stored = localStorage.getItem(LS_MOVEMENTS_KEY);
-      if (stored) return JSON.parse(stored);
-    } catch (e) {
-      console.error('Failed to load movements from localStorage', e);
-    }
-    return INITIAL_MOVEMENTS;
-  });
-
-  const [users, setUsers] = useState<UserAccount[]>(() => {
-    try {
-      const stored = localStorage.getItem(LS_USERS_KEY);
-      if (stored) {
-        const parsed: UserAccount[] = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          return parsed.map((u) => {
-            const isAdm =
-              u.username.toLowerCase() === 'willian' ||
-              u.username.toLowerCase() === 'admin' ||
-              Number(u.nivel) === 2;
-            return {
-              ...u,
-              nivel: (isAdm ? 2 : 1) as UserLevel,
-              roleName: isAdm ? 'Administrador' : 'Operador',
-            };
-          });
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load users from localStorage', e);
-    }
-    return INITIAL_USERS;
-  });
-
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
-    try {
-      const stored = localStorage.getItem(LS_CURRENT_USER_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed && typeof parsed === 'object') {
-          const isAdm =
-            parsed.username?.toLowerCase() === 'willian' ||
-            parsed.username?.toLowerCase() === 'admin' ||
-            Number(parsed.nivel) === 2;
-          const nivelNum: UserLevel = isAdm ? 2 : 1;
-          return {
-            ...parsed,
-            nivel: nivelNum,
-            roleName: nivelNum === 2 ? 'Administrador' : 'Operador',
-          };
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load current user', e);
-    }
-    // Default to Willian (Admin) so the system opens directly ready to use
-    return INITIAL_USERS[0];
-  });
-
-  const [categories, setCategories] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem(LS_CATEGORIES_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.error('Failed to load categories from localStorage', e);
-    }
-    return INITIAL_CATEGORIES;
-  });
-
-  const [packagingTypes, setPackagingTypes] = useState<PackagingType[]>(() => {
-    try {
-      const stored = localStorage.getItem(LS_PACKAGING_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.error('Failed to load packaging types from localStorage', e);
-    }
-    return INITIAL_PACKAGING_TYPES;
-  });
-
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [products, setProducts] = useState<StockProduct[]>([]);
+  const [movements, setMovements] = useState<StockMovement[]>([]);
+  const [users, setUsers] = useState<UserAccount[]>([]);
+  const [categoryDocs, setCategoryDocs] = useState<CategoryDoc[]>([]);
+  const [packagingDocs, setPackagingDocs] = useState<PackagingDoc[]>([]);
   const [lastUpdatedTime, setLastUpdatedTime] = useState<string>(getNowFormatted());
 
-  // Save to localStorage on change
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_PRODUCTS_KEY, JSON.stringify(products));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [products]);
+  const seedAttemptedRef = useRef(false);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_MOVEMENTS_KEY, JSON.stringify(movements));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [movements]);
+  // Surface any async Firestore permission errors cleanly to React ErrorBoundary
+  if (fatalError) {
+    throw fatalError;
+  }
 
-  useEffect(() => {
+  const reportAsyncError = (error: unknown, op: OperationType, path: string) => {
     try {
-      localStorage.setItem(LS_USERS_KEY, JSON.stringify(users));
-    } catch (e) {
-      console.error(e);
+      handleFirestoreError(error, op, path);
+    } catch (wrapped) {
+      setFatalError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
     }
-  }, [users]);
+  };
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_CATEGORIES_KEY, JSON.stringify(categories));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [categories]);
+  // Derived string list of categories & packaging types
+  const categories = React.useMemo(() => {
+    if (categoryDocs.length === 0) return INITIAL_CATEGORIES;
+    return categoryDocs.map((c) => c.nome);
+  }, [categoryDocs]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_PACKAGING_KEY, JSON.stringify(packagingTypes));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [packagingTypes]);
+  const packagingTypes: PackagingType[] = React.useMemo(() => {
+    if (packagingDocs.length === 0) return INITIAL_PACKAGING_TYPES;
+    return packagingDocs.map((p) => ({ id: p.id, sigla: p.sigla, nome: p.nome }));
+  }, [packagingDocs]);
 
+  // 1. Listen to Firebase Auth state and sync the user's profile doc in /users/{uid}
   useEffect(() => {
-    try {
-      if (currentUser) {
-        // Enforce Willian is always Admin
-        if (currentUser.username.toLowerCase() === 'willian' && currentUser.nivel !== 2) {
-          const fixedUser: UserAccount = {
-            ...currentUser,
-            nivel: 2,
-            roleName: 'Administrador',
-          };
-          setCurrentUser(fixedUser);
-          localStorage.setItem(LS_CURRENT_USER_KEY, JSON.stringify(fixedUser));
-        } else {
-          localStorage.setItem(LS_CURRENT_USER_KEY, JSON.stringify(currentUser));
-        }
-        localStorage.setItem('wl_last_username', currentUser.username);
-      } else {
-        localStorage.removeItem(LS_CURRENT_USER_KEY);
+    let unsubProfile: (() => void) | null = null;
+
+    const unsubAuth = onAuthStateChanged(auth, async (fbUser) => {
+      if (unsubProfile) {
+        unsubProfile();
+        unsubProfile = null;
       }
-    } catch (e) {
-      console.error(e);
+
+      setFirebaseUser(fbUser);
+
+      if (!fbUser) {
+        setCurrentUser(null);
+        setUsers([]);
+        setProducts([]);
+        setMovements([]);
+        setCategoryDocs([]);
+        setPackagingDocs([]);
+        setIsAccessSuspended(false);
+        setAuthReady(true);
+        return;
+      }
+
+      setIsSyncing(true);
+      const userPath = `users/${fbUser.uid}`;
+      const userDocRef = doc(db, 'users', fbUser.uid);
+      const emailLower = (fbUser.email || '').toLowerCase();
+      const isBootstrap = emailLower === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+
+      try {
+        const snap = await getDoc(userDocRef);
+        if (!snap.exists()) {
+          const displayName = sanitizeString(
+            fbUser.displayName || (fbUser.email ? fbUser.email.split('@')[0] : 'Operador'),
+            BLUEPRINT_LIMITS.usernameMaxLength
+          );
+          await setDoc(userDocRef, {
+            uid: fbUser.uid,
+            username: displayName || 'Operador',
+            email: sanitizeString(fbUser.email || '', BLUEPRINT_LIMITS.emailMaxLength),
+            role: isBootstrap ? 'admin' : 'operator',
+            active: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else if (isBootstrap && snap.data()?.role !== 'admin') {
+          await updateDoc(userDocRef, {
+            role: 'admin',
+            active: true,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch (err) {
+        reportAsyncError(err, OperationType.WRITE, userPath);
+        setAuthReady(true);
+        setIsSyncing(false);
+        return;
+      }
+
+      unsubProfile = onSnapshot(
+        userDocRef,
+        (docSnap) => {
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            const isAdm = isBootstrap || data.role === 'admin';
+            const active = isBootstrap ? true : data.active !== false;
+            setIsAccessSuspended(!active);
+            setCurrentUser({
+              uid: fbUser.uid,
+              username: data.username || fbUser.displayName || 'Operador',
+              email: data.email || fbUser.email || '',
+              passwordHash: '',
+              nivel: (isAdm ? 2 : 1) as UserLevel,
+              roleName: isAdm ? 'Administrador' : 'Operador',
+              role: isAdm ? 'admin' : 'operator',
+              active,
+              createdAt: formatTimestamp(data.createdAt),
+            });
+          }
+          setAuthReady(true);
+        },
+        (err) => {
+          reportAsyncError(err, OperationType.GET, userPath);
+          setAuthReady(true);
+        }
+      );
+    });
+
+    return () => {
+      if (unsubProfile) unsubProfile();
+      unsubAuth();
+    };
+  }, []);
+
+  // 2. Seed initial warehouse catalog once when an Admin signs in on a fresh database
+  const seedInitialDataToFirestore = async (uid: string) => {
+    const nowStr = getNowFormatted();
+
+    // Commit in safe batches (max 400 writes per batch)
+    const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
+
+    const prodIdByNumber = new Map<number, string>();
+    const prodIdByName = new Map<string, string>();
+
+    INITIAL_PRODUCTS.forEach((p) => {
+      const pid = sanitizeDocId(p.id || `prod_${p.numero}`, 'prod');
+      prodIdByNumber.set(p.numero, pid);
+      prodIdByName.set(p.nome.trim().toUpperCase(), pid);
+      operations.push((b) => {
+        b.set(doc(db, 'products', pid), {
+          id: pid,
+          workspaceId: WORKSPACE_ID,
+          numero: Math.max(1, Math.floor(p.numero)),
+          nome: sanitizeString(p.nome.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
+          quantidade: clampQuantity(p.quantidade),
+          estoqueMinimo: clampQuantity(p.estoqueMinimo || 15),
+          unidade: sanitizeString(p.unidade || 'UN', BLUEPRINT_LIMITS.unitMaxLength),
+          categoria: sanitizeString(p.categoria || 'Outros', BLUEPRINT_LIMITS.categoryNameMaxLength),
+          ultimaAtualizacao: sanitizeString(p.ultimaAtualizacao || nowStr, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+          inativo: Boolean(p.inativo),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+    });
+
+    INITIAL_CATEGORIES.forEach((cat) => {
+      const cid = sanitizeDocId(`cat_${cat}`, 'cat');
+      operations.push((b) => {
+        b.set(doc(db, 'categories', cid), {
+          id: cid,
+          workspaceId: WORKSPACE_ID,
+          nome: sanitizeString(cat, BLUEPRINT_LIMITS.categoryNameMaxLength),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+    });
+
+    INITIAL_PACKAGING_TYPES.forEach((pt) => {
+      const pkid = sanitizeDocId(`pack_${pt.sigla}`, 'pack');
+      operations.push((b) => {
+        b.set(doc(db, 'packagingTypes', pkid), {
+          id: pkid,
+          workspaceId: WORKSPACE_ID,
+          sigla: sanitizeString(pt.sigla.toUpperCase(), BLUEPRINT_LIMITS.packagingSiglaMaxLength),
+          nome: sanitizeString(pt.nome, BLUEPRINT_LIMITS.packagingNameMaxLength),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+    });
+
+    INITIAL_MOVEMENTS.forEach((m, idx) => {
+      const mid = sanitizeDocId(m.id || `mov_${idx + 1}`, 'mov');
+      const qty = Math.max(1, clampQuantity(m.quantidade));
+      const matchedProductId =
+        prodIdByName.get(m.produto.trim().toUpperCase()) || prodIdByNumber.get(m.numero);
+
+      const movPayload: Record<string, unknown> = {
+        id: mid,
+        workspaceId: WORKSPACE_ID,
+        dataHora: sanitizeString(m.dataHora || nowStr, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+        numero: Math.max(1, Math.floor(m.numero || 1)),
+        produto: sanitizeString(m.produto.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
+        tipo: m.tipo === 'Saída' ? 'Saída' : 'Entrada',
+        quantidade: qty,
+        usuario: sanitizeString(m.usuario || 'Sistema', BLUEPRINT_LIMITS.usernameMaxLength),
+        userId: uid,
+        createdAt: serverTimestamp(),
+      };
+      if (matchedProductId) {
+        movPayload.productId = matchedProductId;
+      }
+      if (m.observacao) {
+        movPayload.observacao = sanitizeString(m.observacao, BLUEPRINT_LIMITS.observacaoMaxLength);
+      }
+
+      operations.push((b) => {
+        b.set(doc(db, 'movements', mid), movPayload);
+      });
+    });
+
+    operations.push((b) => {
+      b.set(doc(db, 'metadata', 'bootstrap'), {
+        workspaceId: WORKSPACE_ID,
+        seeded: true,
+        seededBy: uid,
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    const CHUNK_SIZE = 350;
+    for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      operations.slice(i, i + CHUNK_SIZE).forEach((fn) => fn(batch));
+      await batch.commit();
     }
-  }, [currentUser]);
+  };
+
+  useEffect(() => {
+    if (!authReady || !firebaseUser || !currentUser || isAccessSuspended) return;
+    if (!isUserAdmin(currentUser) || seedAttemptedRef.current) return;
+
+    seedAttemptedRef.current = true;
+    const bootstrapRef = doc(db, 'metadata', 'bootstrap');
+
+    (async () => {
+      try {
+        const snap = await getDoc(bootstrapRef);
+        if (!snap.exists()) {
+          await seedInitialDataToFirestore(firebaseUser.uid);
+        }
+      } catch (err) {
+        reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap');
+      }
+    })();
+  }, [authReady, firebaseUser, currentUser, isAccessSuspended]);
+
+  // 3. Attach real-time Firestore onSnapshot listeners ONLY when auth is ready & user is active
+  useEffect(() => {
+    if (!authReady || !firebaseUser || !currentUser || isAccessSuspended) {
+      setIsSyncing(false);
+      return;
+    }
+
+    setIsSyncing(true);
+    let productsLoaded = false;
+
+    const productsQuery = query(
+      collection(db, 'products'),
+      where('workspaceId', '==', WORKSPACE_ID)
+    );
+    const unsubProducts = onSnapshot(
+      productsQuery,
+      (snapshot) => {
+        const list: StockProduct[] = snapshot.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: data.id || d.id,
+            numero: Number(data.numero) || 1,
+            nome: String(data.nome || ''),
+            quantidade: Number(data.quantidade) || 0,
+            estoqueMinimo: Number(data.estoqueMinimo) || 15,
+            unidade: String(data.unidade || 'UN'),
+            categoria: String(data.categoria || 'Outros'),
+            ultimaAtualizacao: String(data.ultimaAtualizacao || ''),
+            inativo: Boolean(data.inativo),
+          };
+        });
+        list.sort((a, b) => a.numero - b.numero);
+        setProducts(list);
+        setLastUpdatedTime(getNowFormatted());
+        if (!productsLoaded) {
+          productsLoaded = true;
+          setIsSyncing(false);
+        }
+      },
+      (err) => {
+        reportAsyncError(err, OperationType.LIST, 'products');
+        setIsSyncing(false);
+      }
+    );
+
+    const movementsQuery = query(
+      collection(db, 'movements'),
+      where('workspaceId', '==', WORKSPACE_ID)
+    );
+    const unsubMovements = onSnapshot(
+      movementsQuery,
+      (snapshot) => {
+        const raw = snapshot.docs.map((d) => {
+          const data = d.data();
+          const createdMs =
+            data.createdAt instanceof Timestamp
+              ? data.createdAt.toMillis()
+              : parseBrDateToMs(String(data.dataHora || ''));
+          return {
+            sortKey: parseBrDateToMs(String(data.dataHora || '')) || createdMs,
+            createdMs,
+            item: {
+              id: data.id || d.id,
+              productId: data.productId,
+              dataHora: String(data.dataHora || ''),
+              numero: Number(data.numero) || 1,
+              produto: String(data.produto || ''),
+              tipo: (data.tipo === 'Saída' ? 'Saída' : 'Entrada') as 'Entrada' | 'Saída',
+              quantidade: Number(data.quantidade) || 0,
+              usuario: String(data.usuario || 'Operador'),
+              userId: data.userId,
+              saldoApos: typeof data.saldoApos === 'number' ? data.saldoApos : undefined,
+              observacao: data.observacao,
+            } as StockMovement,
+          };
+        });
+
+        raw.sort((a, b) => {
+          if (b.sortKey !== a.sortKey) return b.sortKey - a.sortKey;
+          return b.createdMs - a.createdMs;
+        });
+
+        setMovements(raw.map((r) => r.item));
+        setLastUpdatedTime(getNowFormatted());
+      },
+      (err) => {
+        reportAsyncError(err, OperationType.LIST, 'movements');
+      }
+    );
+
+    const categoriesQuery = query(
+      collection(db, 'categories'),
+      where('workspaceId', '==', WORKSPACE_ID)
+    );
+    const unsubCategories = onSnapshot(
+      categoriesQuery,
+      (snapshot) => {
+        const list: CategoryDoc[] = snapshot.docs.map((d) => ({
+          id: d.id,
+          nome: String(d.data().nome || ''),
+        }));
+        list.sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+        setCategoryDocs(list);
+      },
+      (err) => {
+        reportAsyncError(err, OperationType.LIST, 'categories');
+      }
+    );
+
+    const packagingQuery = query(
+      collection(db, 'packagingTypes'),
+      where('workspaceId', '==', WORKSPACE_ID)
+    );
+    const unsubPackaging = onSnapshot(
+      packagingQuery,
+      (snapshot) => {
+        const list: PackagingDoc[] = snapshot.docs.map((d) => ({
+          id: d.id,
+          sigla: String(d.data().sigla || ''),
+          nome: String(d.data().nome || ''),
+        }));
+        list.sort((a, b) => a.sigla.localeCompare(b.sigla, 'pt-BR'));
+        setPackagingDocs(list);
+      },
+      (err) => {
+        reportAsyncError(err, OperationType.LIST, 'packagingTypes');
+      }
+    );
+
+    // Only Admins subscribe to the /users directory (PII Isolation)
+    let unsubUsers: (() => void) | null = null;
+    if (isUserAdmin(currentUser)) {
+      unsubUsers = onSnapshot(
+        collection(db, 'users'),
+        (snapshot) => {
+          const list: UserAccount[] = snapshot.docs.map((d) => {
+            const data = d.data();
+            const isAdm =
+              data.role === 'admin' ||
+              String(data.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+            return {
+              uid: d.id,
+              username: String(data.username || 'Usuário'),
+              email: String(data.email || ''),
+              passwordHash: '',
+              nivel: (isAdm ? 2 : 1) as UserLevel,
+              roleName: isAdm ? 'Administrador' : 'Operador',
+              role: isAdm ? 'admin' : 'operator',
+              active: data.active !== false,
+              createdAt: formatTimestamp(data.createdAt),
+            };
+          });
+          list.sort((a, b) => {
+            if (b.nivel !== a.nivel) return b.nivel - a.nivel;
+            return a.username.localeCompare(b.username, 'pt-BR');
+          });
+          setUsers(list);
+        },
+        (err) => {
+          reportAsyncError(err, OperationType.LIST, 'users');
+        }
+      );
+    } else {
+      setUsers([currentUser]);
+    }
+
+    return () => {
+      unsubProducts();
+      unsubMovements();
+      unsubCategories();
+      unsubPackaging();
+      if (unsubUsers) unsubUsers();
+    };
+  }, [authReady, firebaseUser?.uid, currentUser?.nivel, isAccessSuspended]);
 
   // Derived system metrics
   const stats: SystemStats = React.useMemo(() => {
@@ -233,12 +583,17 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const totalProdutos = activeProducts.length;
     const totalUnidades = activeProducts.reduce((acc, p) => acc + (p.quantidade || 0), 0);
     const produtosZerados = activeProducts.filter((p) => p.quantidade <= 0).length;
-    const produtosEstoqueBaixo = activeProducts.filter((p) => p.quantidade > 0 && p.quantidade <= p.estoqueMinimo).length;
+    const produtosEstoqueBaixo = activeProducts.filter(
+      (p) => p.quantidade > 0 && p.quantidade <= p.estoqueMinimo
+    ).length;
     const produtosInativos = inactiveProducts.length;
 
-    // Movement totals
-    const totalEntradasMes = movements.filter((m) => m.tipo === 'Entrada').reduce((acc, m) => acc + m.quantidade, 0);
-    const totalSaidasMes = movements.filter((m) => m.tipo === 'Saída').reduce((acc, m) => acc + m.quantidade, 0);
+    const totalEntradasMes = movements
+      .filter((m) => m.tipo === 'Entrada')
+      .reduce((acc, m) => acc + m.quantidade, 0);
+    const totalSaidasMes = movements
+      .filter((m) => m.tipo === 'Saída')
+      .reduce((acc, m) => acc + m.quantidade, 0);
 
     return {
       totalProdutos,
@@ -251,37 +606,49 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
   }, [products, movements]);
 
-  const login = (usernameInput: string, passInput: string): { success: boolean; message?: string } => {
-    const trimmedUser = usernameInput.trim();
-    const found = users.find(
-      (u) => u.username.toLowerCase() === trimmedUser.toLowerCase() && u.passwordHash === passInput
-    );
-    if (found) {
-      const isAdm =
-        found.username.toLowerCase() === 'willian' ||
-        found.username.toLowerCase() === 'admin' ||
-        Number(found.nivel) === 2;
-      const userToSet: UserAccount = {
-        ...found,
-        nivel: (isAdm ? 2 : 1) as UserLevel,
-        roleName: isAdm ? 'Administrador' : 'Operador',
-      };
-      setCurrentUser(userToSet);
+  // Auth actions
+  const signInWithGoogle = async (): Promise<{ success: boolean; message?: string }> => {
+    try {
+      await signInWithPopup(auth, googleProvider);
       return { success: true };
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        return { success: false, message: 'Login cancelado. Clique novamente para entrar com sua conta Google.' };
+      }
+      if (code === 'auth/unauthorized-domain') {
+        return {
+          success: false,
+          message:
+            'Domínio ainda não autorizado no Firebase Authentication. Adicione este endereço em Authentication → Settings → Authorized domains no Console do Firebase.',
+        };
+      }
+      if (code === 'auth/popup-blocked') {
+        return {
+          success: false,
+          message: 'O navegador bloqueou a janela de login. Permita pop-ups para este site e tente novamente.',
+        };
+      }
+      return {
+        success: false,
+        message: err?.message || 'Não foi possível entrar com o Google. Tente novamente.',
+      };
     }
-    return { success: false, message: 'Usuário ou senha incorretos.' };
   };
 
-  const logout = () => {
-    if (currentUser?.username) {
-      try {
-        localStorage.setItem('wl_last_username', currentUser.username);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    setCurrentUser(null);
+  // Legacy signature kept for backward compatibility
+  const login = (): { success: boolean; message?: string } => {
+    return { success: false, message: 'Use o botão "Entrar com Google" para acessar o estoque na nuvem.' };
   };
+
+  const logout = async () => {
+    seedAttemptedRef.current = false;
+    await signOut(auth);
+  };
+
+  // =========================================================================
+  // FIRESTORE MUTATIONS (Real-time synchronized across all devices)
+  // =========================================================================
 
   const registerMovement = (
     productId: string,
@@ -289,66 +656,79 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     quantidade: number,
     observacao?: string
   ): { success: boolean; message: string } => {
+    if (!auth.currentUser || !currentUser) {
+      return { success: false, message: 'Sessão expirada. Faça login novamente.' };
+    }
     if (quantidade <= 0 || isNaN(quantidade)) {
       return { success: false, message: 'A quantidade deve ser maior que zero.' };
     }
 
-    const prodIndex = products.findIndex((p) => p.id === productId);
-    if (prodIndex === -1) {
+    const targetProduct = products.find((p) => p.id === productId);
+    if (!targetProduct) {
       return { success: false, message: 'Produto não encontrado.' };
     }
 
-    const targetProduct = products[prodIndex];
-
-    if (tipo === 'Saída' && quantidade > targetProduct.quantidade) {
+    const cleanQty = clampQuantity(quantidade);
+    if (tipo === 'Saída' && cleanQty > targetProduct.quantidade) {
       return {
         success: false,
-        message: `Saída (${quantidade}) maior que o estoque atual disponível (${targetProduct.quantidade}).`,
+        message: `Saída (${cleanQty}) maior que o estoque atual disponível (${targetProduct.quantidade}).`,
       };
     }
 
-    const novoSaldo = tipo === 'Entrada' ? targetProduct.quantidade + quantidade : targetProduct.quantidade - quantidade;
+    const novoSaldo =
+      tipo === 'Entrada'
+        ? clampQuantity(targetProduct.quantidade + cleanQty)
+        : clampQuantity(targetProduct.quantidade - cleanQty);
     const timestamp = getNowFormatted();
     const wasInactive = Boolean(targetProduct.inativo);
-    const shouldReactivate = wasInactive && tipo === 'Entrada' && quantidade > 0;
+    const shouldReactivate = wasInactive && tipo === 'Entrada' && cleanQty > 0;
+    const movId = `mov_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
-    const updatedProduct: StockProduct = {
-      ...targetProduct,
+    const finalObs = observacao
+      ? shouldReactivate
+        ? `${observacao} (Reativação de produto)`
+        : observacao
+      : shouldReactivate
+      ? 'Reativação de produto via entrada de estoque'
+      : undefined;
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'products', productId), {
       quantidade: novoSaldo,
-      inativo: shouldReactivate ? false : targetProduct.inativo,
-      ultimaAtualizacao: timestamp,
-    };
+      inativo: shouldReactivate ? false : Boolean(targetProduct.inativo),
+      ultimaAtualizacao: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      updatedAt: serverTimestamp(),
+    });
 
-    const newMovement: StockMovement = {
-      id: `mov_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      dataHora: timestamp,
-      numero: targetProduct.numero,
-      produto: targetProduct.nome,
+    const movPayload: Record<string, unknown> = {
+      id: movId,
+      workspaceId: WORKSPACE_ID,
+      productId,
+      dataHora: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      numero: Math.max(1, Math.floor(targetProduct.numero)),
+      produto: sanitizeString(targetProduct.nome.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
       tipo,
-      quantidade,
-      usuario: currentUser?.username || 'Sistema',
+      quantidade: cleanQty,
+      usuario: sanitizeString(currentUser.username, BLUEPRINT_LIMITS.usernameMaxLength),
+      userId: auth.currentUser.uid,
       saldoApos: novoSaldo,
-      observacao: observacao
-        ? shouldReactivate
-          ? `${observacao} (Reativação de produto)`
-          : observacao
-        : shouldReactivate
-        ? 'Reativação de produto via entrada de estoque'
-        : undefined,
+      createdAt: serverTimestamp(),
     };
+    if (finalObs) {
+      movPayload.observacao = sanitizeString(finalObs, BLUEPRINT_LIMITS.observacaoMaxLength);
+    }
+    batch.set(doc(db, 'movements', movId), movPayload);
 
-    const newProducts = [...products];
-    newProducts[prodIndex] = updatedProduct;
-
-    setProducts(newProducts);
-    setMovements([newMovement, ...movements]);
-    setLastUpdatedTime(timestamp);
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.WRITE, `products/${productId}`);
+    });
 
     return {
       success: true,
       message: shouldReactivate
-        ? `Entrada de ${quantidade} ${targetProduct.unidade}(s) registrada! O produto "${targetProduct.nome}" foi reativado e voltou para a lista principal.`
-        : `${tipo} de ${quantidade} ${targetProduct.unidade}(s) registrada com sucesso!`,
+        ? `Entrada de ${cleanQty} ${targetProduct.unidade}(s) registrada! O produto "${targetProduct.nome}" foi reativado e sincronizado na nuvem.`
+        : `${tipo} de ${cleanQty} ${targetProduct.unidade}(s) registrada e sincronizada em tempo real!`,
     };
   };
 
@@ -356,69 +736,48 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     id: string,
     revertStock: boolean = true
   ): { success: boolean; message: string } => {
-    // Admin validation
-    const isAdm = Boolean(
-      currentUser &&
-        (currentUser.nivel === 2 ||
-          Number(currentUser.nivel) === 2 ||
-          currentUser.username.toLowerCase() === 'willian' ||
-          currentUser.username.toLowerCase() === 'admin')
-    );
-
-    if (!isAdm) {
+    if (!isUserAdmin(currentUser)) {
       return {
         success: false,
         message: 'Apenas usuários administradores têm permissão para excluir registros do histórico.',
       };
     }
 
-    const targetIndex = movements.findIndex((m) => m.id === id);
-    if (targetIndex === -1) {
+    const targetMovement = movements.find((m) => m.id === id);
+    if (!targetMovement) {
       return { success: false, message: 'Registro de movimentação não encontrado.' };
     }
 
-    const targetMovement = movements[targetIndex];
     let stockMessage = '';
+    const batch = writeBatch(db);
 
-    // Revert product stock balance if requested
     if (revertStock) {
-      const prodIndex = products.findIndex(
+      const prod = products.find(
         (p) =>
+          (targetMovement.productId && p.id === targetMovement.productId) ||
           p.numero === targetMovement.numero ||
           p.nome.trim().toUpperCase() === targetMovement.produto.trim().toUpperCase()
       );
 
-      if (prodIndex !== -1) {
-        const prod = products[prodIndex];
-        let newQty = prod.quantidade;
+      if (prod) {
+        const newQty =
+          targetMovement.tipo === 'Entrada'
+            ? clampQuantity(prod.quantidade - targetMovement.quantidade)
+            : clampQuantity(prod.quantidade + targetMovement.quantidade);
+        stockMessage = ` O estoque de "${prod.nome}" foi estornado de ${prod.quantidade} para ${newQty} ${prod.unidade}(s).`;
 
-        if (targetMovement.tipo === 'Entrada') {
-          // Reverting an Entrada: subtract quantity from current stock
-          newQty = Math.max(0, prod.quantidade - targetMovement.quantidade);
-          stockMessage = ` O estoque de "${prod.nome}" foi estornado de ${prod.quantidade} para ${newQty} ${prod.unidade}(s).`;
-        } else {
-          // Reverting a Saída: return quantity back into stock
-          newQty = prod.quantidade + targetMovement.quantidade;
-          stockMessage = ` O estoque de "${prod.nome}" foi estornado de ${prod.quantidade} para ${newQty} ${prod.unidade}(s).`;
-        }
-
-        const timestamp = getNowFormatted();
-        const updatedProduct: StockProduct = {
-          ...prod,
+        batch.update(doc(db, 'products', prod.id), {
           quantidade: newQty,
-          ultimaAtualizacao: timestamp,
-        };
-
-        const updatedProducts = [...products];
-        updatedProducts[prodIndex] = updatedProduct;
-        setProducts(updatedProducts);
+          ultimaAtualizacao: sanitizeString(getNowFormatted(), BLUEPRINT_LIMITS.dateDisplayMaxLength),
+          updatedAt: serverTimestamp(),
+        });
       }
     }
 
-    // Remove from movements list
-    const remainingMovements = movements.filter((_, idx) => idx !== targetIndex);
-    setMovements(remainingMovements);
-    setLastUpdatedTime(getNowFormatted());
+    batch.delete(doc(db, 'movements', id));
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `movements/${id}`);
+    });
 
     return {
       success: true,
@@ -433,447 +792,704 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     unidade?: string,
     categoria?: string
   ): { success: boolean; message: string } => {
-    const cleanName = nome.trim().toUpperCase();
+    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem cadastrar novos produtos.' };
+    }
+
+    const cleanName = sanitizeString(nome.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength);
     if (!cleanName) {
       return { success: false, message: 'Informe o nome do produto.' };
     }
 
-    // Check duplicate
     const exists = products.some((p) => p.nome.toUpperCase() === cleanName);
     if (exists) {
-      return { success: false, message: 'Já existe um produto cadastrado com este nome.' };
+      return { success: false, message: `Já existe um produto cadastrado com o nome "${cleanName}".` };
     }
 
-    const maxNum = products.reduce((max, p) => (p.numero > max ? p.numero : max), 0);
-    const numero = maxNum + 1;
-    const initialQty = Math.max(0, quantidadeInicial || 0);
+    const maxNum = products.reduce((max, p) => Math.max(max, p.numero), 0);
+    const numero = Math.floor(maxNum + 1);
     const timestamp = getNowFormatted();
+    const initialQty = clampQuantity(quantidadeInicial || 0);
+    const prodId = `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const unitFinal = sanitizeString(unidade || inferUnit(cleanName), BLUEPRINT_LIMITS.unitMaxLength);
+    const catFinal = sanitizeString(categoria || inferCategory(cleanName), BLUEPRINT_LIMITS.categoryNameMaxLength);
 
-    const newProd: StockProduct = {
-      id: `prod_${Date.now()}`,
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'products', prodId), {
+      id: prodId,
+      workspaceId: WORKSPACE_ID,
       numero,
       nome: cleanName,
       quantidade: initialQty,
-      estoqueMinimo: estoqueMinimo || 15,
-      unidade: unidade || inferUnit(cleanName),
-      categoria: categoria || inferCategory(cleanName),
-      ultimaAtualizacao: timestamp,
-    };
-
-    setProducts([...products, newProd]);
-    setLastUpdatedTime(timestamp);
+      estoqueMinimo: clampQuantity(estoqueMinimo || 15),
+      unidade: unitFinal,
+      categoria: catFinal,
+      ultimaAtualizacao: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      inativo: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
 
     if (initialQty > 0) {
-      const initialMovement: StockMovement = {
-        id: `mov_${Date.now()}`,
-        dataHora: timestamp,
+      const movId = `mov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      batch.set(doc(db, 'movements', movId), {
+        id: movId,
+        workspaceId: WORKSPACE_ID,
+        productId: prodId,
+        dataHora: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
         numero,
         produto: cleanName,
         tipo: 'Entrada',
         quantidade: initialQty,
-        usuario: currentUser?.username || 'Sistema',
+        usuario: sanitizeString(currentUser?.username || 'Admin', BLUEPRINT_LIMITS.usernameMaxLength),
+        userId: auth.currentUser.uid,
         saldoApos: initialQty,
         observacao: 'Carga inicial de cadastro',
-      };
-      setMovements([initialMovement, ...movements]);
+        createdAt: serverTimestamp(),
+      });
     }
 
-    return { success: true, message: `Produto "${cleanName}" cadastrado com sucesso!` };
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.CREATE, `products/${prodId}`);
+    });
+
+    return { success: true, message: `Produto "${cleanName}" cadastrado e sincronizado na nuvem!` };
   };
 
-  const updateProduct = (id: string, updates: Partial<StockProduct>): { success: boolean; message: string } => {
-    const prodIndex = products.findIndex((p) => p.id === id);
-    if (prodIndex === -1) {
+  const updateProduct = (
+    id: string,
+    updates: Partial<StockProduct>
+  ): { success: boolean; message: string } => {
+    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem editar produtos.' };
+    }
+
+    const current = products.find((p) => p.id === id);
+    if (!current) {
       return { success: false, message: 'Produto não encontrado.' };
     }
 
-    const current = products[prodIndex];
     const timestamp = getNowFormatted();
-
-    // If quantity is adjusted directly
-    if (typeof updates.quantidade === 'number' && updates.quantidade !== current.quantidade) {
-      const diff = updates.quantidade - current.quantidade;
-      const tipo: 'Entrada' | 'Saída' = diff > 0 ? 'Entrada' : 'Saída';
-      const absDiff = Math.abs(diff);
-
-      const adjustmentMovement: StockMovement = {
-        id: `mov_${Date.now()}`,
-        dataHora: timestamp,
-        numero: current.numero,
-        produto: updates.nome ? updates.nome.toUpperCase() : current.nome,
-        tipo,
-        quantidade: absDiff,
-        usuario: currentUser?.username || 'Sistema',
-        saldoApos: updates.quantidade,
-        observacao: 'Ajuste manual de inventário',
-      };
-      setMovements([adjustmentMovement, ...movements]);
-    }
-
-    const updated: StockProduct = {
-      ...current,
-      ...updates,
-      nome: updates.nome ? updates.nome.trim().toUpperCase() : current.nome,
-      ultimaAtualizacao: timestamp,
+    const cleanUpdates: Record<string, unknown> = {
+      ultimaAtualizacao: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      updatedAt: serverTimestamp(),
     };
 
-    const newProducts = [...products];
-    newProducts[prodIndex] = updated;
-    setProducts(newProducts);
-    setLastUpdatedTime(timestamp);
+    if (typeof updates.nome === 'string' && updates.nome.trim()) {
+      cleanUpdates.nome = sanitizeString(updates.nome.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength);
+    }
+    if (typeof updates.quantidade === 'number') {
+      cleanUpdates.quantidade = clampQuantity(updates.quantidade);
+    }
+    if (typeof updates.estoqueMinimo === 'number') {
+      cleanUpdates.estoqueMinimo = clampQuantity(updates.estoqueMinimo);
+    }
+    if (typeof updates.unidade === 'string' && updates.unidade.trim()) {
+      cleanUpdates.unidade = sanitizeString(updates.unidade, BLUEPRINT_LIMITS.unitMaxLength);
+    }
+    if (typeof updates.categoria === 'string' && updates.categoria.trim()) {
+      cleanUpdates.categoria = sanitizeString(updates.categoria, BLUEPRINT_LIMITS.categoryNameMaxLength);
+    }
+    if (typeof updates.inativo === 'boolean') {
+      cleanUpdates.inativo = updates.inativo;
+    }
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'products', id), cleanUpdates);
+
+    if (typeof updates.quantidade === 'number' && updates.quantidade !== current.quantidade) {
+      const nextQty = clampQuantity(updates.quantidade);
+      const diff = nextQty - current.quantidade;
+      if (diff !== 0) {
+        const movId = `mov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        batch.set(doc(db, 'movements', movId), {
+          id: movId,
+          workspaceId: WORKSPACE_ID,
+          productId: id,
+          dataHora: sanitizeString(timestamp, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+          numero: Math.max(1, Math.floor(current.numero)),
+          produto: String(cleanUpdates.nome || current.nome),
+          tipo: diff > 0 ? 'Entrada' : 'Saída',
+          quantidade: Math.abs(diff),
+          usuario: sanitizeString(currentUser?.username || 'Admin', BLUEPRINT_LIMITS.usernameMaxLength),
+          userId: auth.currentUser.uid,
+          saldoApos: nextQty,
+          observacao: 'Ajuste manual de inventário',
+          createdAt: serverTimestamp(),
+        });
+      }
+    }
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `products/${id}`);
+    });
 
     return { success: true, message: 'Produto atualizado com sucesso!' };
   };
 
   const removeProduct = (id: string): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem excluir produtos.' };
+    }
     const target = products.find((p) => p.id === id);
     if (!target) {
       return { success: false, message: 'Produto não encontrado.' };
     }
 
-    // Renumber remaining products sequentially like in PyQt5
     const remaining = products.filter((p) => p.id !== id);
-    const renumbered = remaining.map((p, idx) => ({
-      ...p,
-      numero: idx + 1,
-    }));
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'products', id));
 
-    setProducts(renumbered);
-    setLastUpdatedTime(getNowFormatted());
+    remaining.forEach((p, idx) => {
+      const expectedNum = idx + 1;
+      if (p.numero !== expectedNum) {
+        batch.update(doc(db, 'products', p.id), {
+          numero: expectedNum,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    });
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `products/${id}`);
+    });
 
     return { success: true, message: `Produto "${target.nome}" removido do catálogo!` };
   };
 
   const inactivateProduct = (id: string): { success: boolean; message: string } => {
-    const prodIndex = products.findIndex((p) => p.id === id);
-    if (prodIndex === -1) {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem inativar produtos.' };
+    }
+    const target = products.find((p) => p.id === id);
+    if (!target) {
       return { success: false, message: 'Produto não encontrado.' };
     }
-    const target = products[prodIndex];
-    const timestamp = getNowFormatted();
-    const updated: StockProduct = {
-      ...target,
+
+    updateDoc(doc(db, 'products', id), {
       inativo: true,
-      ultimaAtualizacao: timestamp,
-    };
-    const newProducts = [...products];
-    newProducts[prodIndex] = updated;
-    setProducts(newProducts);
-    setLastUpdatedTime(timestamp);
+      ultimaAtualizacao: sanitizeString(getNowFormatted(), BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `products/${id}`);
+    });
+
     return {
       success: true,
-      message: `Produto Nº ${target.numero} - "${target.nome}" inativado! Ele sairá da lista principal ("Todos") e poderá ser acessado na aba "Inativos".`,
+      message: `Produto Nº ${target.numero} - "${target.nome}" inativado!`,
     };
   };
 
   const activateProduct = (id: string): { success: boolean; message: string } => {
-    const prodIndex = products.findIndex((p) => p.id === id);
-    if (prodIndex === -1) {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem reativar produtos.' };
+    }
+    const target = products.find((p) => p.id === id);
+    if (!target) {
       return { success: false, message: 'Produto não encontrado.' };
     }
-    const target = products[prodIndex];
-    const timestamp = getNowFormatted();
-    const updated: StockProduct = {
-      ...target,
+
+    updateDoc(doc(db, 'products', id), {
       inativo: false,
-      ultimaAtualizacao: timestamp,
-    };
-    const newProducts = [...products];
-    newProducts[prodIndex] = updated;
-    setProducts(newProducts);
-    setLastUpdatedTime(timestamp);
+      ultimaAtualizacao: sanitizeString(getNowFormatted(), BLUEPRINT_LIMITS.dateDisplayMaxLength),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `products/${id}`);
+    });
+
     return {
       success: true,
       message: `Produto Nº ${target.numero} - "${target.nome}" reativado no catálogo principal!`,
     };
   };
 
+  // Categories
   const addCategory = (nome: string): { success: boolean; message: string } => {
-    const clean = nome.trim();
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar categorias.' };
+    }
+    const clean = sanitizeString(nome, BLUEPRINT_LIMITS.categoryNameMaxLength);
     if (!clean) {
       return { success: false, message: 'O nome da categoria não pode ser vazio.' };
     }
-    const exists = categories.some((c) => c.toLowerCase() === clean.toLowerCase());
-    if (exists) {
+    if (categories.some((c) => c.toLowerCase() === clean.toLowerCase())) {
       return { success: false, message: `A categoria "${clean}" já existe.` };
     }
-    setCategories([...categories, clean]);
+
+    const cid = sanitizeDocId(`cat_${clean}_${Date.now().toString(36)}`, 'cat');
+    setDoc(doc(db, 'categories', cid), {
+      id: cid,
+      workspaceId: WORKSPACE_ID,
+      nome: clean,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.CREATE, `categories/${cid}`);
+    });
+
     return { success: true, message: `Categoria "${clean}" cadastrada com sucesso!` };
   };
 
   const updateCategory = (oldName: string, newName: string): { success: boolean; message: string } => {
-    const clean = newName.trim();
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar categorias.' };
+    }
+    const clean = sanitizeString(newName, BLUEPRINT_LIMITS.categoryNameMaxLength);
     if (!clean) {
       return { success: false, message: 'O novo nome da categoria não pode ser vazio.' };
     }
-    if (oldName.toLowerCase() !== clean.toLowerCase() && categories.some((c) => c.toLowerCase() === clean.toLowerCase())) {
+    if (
+      oldName.toLowerCase() !== clean.toLowerCase() &&
+      categories.some((c) => c.toLowerCase() === clean.toLowerCase())
+    ) {
       return { success: false, message: `Já existe uma categoria chamada "${clean}".` };
     }
 
-    const updatedCategories = categories.map((c) => (c === oldName ? clean : c));
-    setCategories(updatedCategories);
+    const targetDoc = categoryDocs.find((c) => c.nome === oldName);
+    const affectedProducts = products.filter((p) => p.categoria === oldName);
+    const batch = writeBatch(db);
 
-    // Update all products using oldName
-    let count = 0;
-    const updatedProducts = products.map((p) => {
-      if (p.categoria === oldName) {
-        count++;
-        return { ...p, categoria: clean };
-      }
-      return p;
-    });
-    if (count > 0) {
-      setProducts(updatedProducts);
+    if (targetDoc) {
+      batch.update(doc(db, 'categories', targetDoc.id), {
+        nome: clean,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const cid = sanitizeDocId(`cat_${clean}`, 'cat');
+      batch.set(doc(db, 'categories', cid), {
+        id: cid,
+        workspaceId: WORKSPACE_ID,
+        nome: clean,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
     }
+
+    affectedProducts.forEach((p) => {
+      batch.update(doc(db, 'products', p.id), {
+        categoria: clean,
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, 'categories');
+    });
 
     return {
       success: true,
-      message: `Categoria atualizada para "${clean}"${count > 0 ? ` em ${count} produto(s)` : ''}!`,
+      message: `Categoria atualizada para "${clean}"${
+        affectedProducts.length > 0 ? ` em ${affectedProducts.length} produto(s)` : ''
+      }!`,
     };
   };
 
   const removeCategory = (nome: string, reassignTo: string = 'Outros'): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar categorias.' };
+    }
     if (categories.length <= 1) {
-      return { success: false, message: 'O sistema deve possuir pelo menos uma categoria.' };
+      return { success: false, message: 'O sistema deve manter pelo menos 1 categoria ativa.' };
     }
 
-    const updatedCategories = categories.filter((c) => c !== nome);
-    setCategories(updatedCategories);
+    const fallback =
+      reassignTo && reassignTo !== nome && categories.includes(reassignTo)
+        ? reassignTo
+        : categories.find((c) => c !== nome) || 'Outros';
 
-    // Reassign products that used this category
-    const targetCategory = updatedCategories.includes(reassignTo) ? reassignTo : updatedCategories[0];
-    let count = 0;
-    const updatedProducts = products.map((p) => {
-      if (p.categoria === nome) {
-        count++;
-        return { ...p, categoria: targetCategory };
-      }
-      return p;
+    const targetDoc = categoryDocs.find((c) => c.nome === nome);
+    const affectedProducts = products.filter((p) => p.categoria === nome);
+    const batch = writeBatch(db);
+
+    if (targetDoc) {
+      batch.delete(doc(db, 'categories', targetDoc.id));
+    }
+
+    affectedProducts.forEach((p) => {
+      batch.update(doc(db, 'products', p.id), {
+        categoria: fallback,
+        updatedAt: serverTimestamp(),
+      });
     });
-    if (count > 0) {
-      setProducts(updatedProducts);
-    }
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `categories/${targetDoc?.id || nome}`);
+    });
 
     return {
       success: true,
-      message: `Categoria "${nome}" removida${count > 0 ? ` (${count} produto(s) transferidos para "${targetCategory}")` : ''}!`,
+      message:
+        affectedProducts.length > 0
+          ? `Categoria "${nome}" removida. ${affectedProducts.length} produto(s) reclassificado(s) para "${fallback}".`
+          : `Categoria "${nome}" removida com sucesso!`,
     };
   };
 
-  const addPackagingType = (siglaInput: string, nomeInput: string): { success: boolean; message: string } => {
-    const cleanSigla = siglaInput.trim().toUpperCase();
-    const cleanNome = nomeInput.trim() || cleanSigla;
-    if (!cleanSigla) {
-      return { success: false, message: 'A sigla da embalagem é obrigatória (ex: LATA, BALDE).' };
+  // Packaging Types
+  const addPackagingType = (sigla: string, nome: string): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar embalagens.' };
     }
-    if (packagingTypes.some((pt) => pt.sigla.toUpperCase() === cleanSigla)) {
-      return { success: false, message: `Já existe uma embalagem com a sigla "${cleanSigla}".` };
+    const cleanSigla = sanitizeString(sigla.toUpperCase(), BLUEPRINT_LIMITS.packagingSiglaMaxLength);
+    const cleanNome = sanitizeString(nome || cleanSigla, BLUEPRINT_LIMITS.packagingNameMaxLength);
+    if (!cleanSigla) {
+      return { success: false, message: 'A sigla do tipo de embalagem não pode ser vazia.' };
+    }
+    if (packagingTypes.some((p) => p.sigla.toUpperCase() === cleanSigla)) {
+      return { success: false, message: `O tipo de embalagem "${cleanSigla}" já existe.` };
     }
 
-    const newPackaging: PackagingType = {
+    const pkid = sanitizeDocId(`pack_${cleanSigla}_${Date.now().toString(36)}`, 'pack');
+    setDoc(doc(db, 'packagingTypes', pkid), {
+      id: pkid,
+      workspaceId: WORKSPACE_ID,
       sigla: cleanSigla,
       nome: cleanNome,
-    };
-    setPackagingTypes([...packagingTypes, newPackaging]);
-    return { success: true, message: `Tipo de embalagem "${cleanNome}" (${cleanSigla}) cadastrado!` };
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.CREATE, `packagingTypes/${pkid}`);
+    });
+
+    return { success: true, message: `Tipo de embalagem "${cleanSigla}" cadastrado com sucesso!` };
   };
 
-  const updatePackagingType = (oldSigla: string, newSigla: string, newNome: string): { success: boolean; message: string } => {
-    const cleanSigla = newSigla.trim().toUpperCase();
-    const cleanNome = newNome.trim() || cleanSigla;
+  const updatePackagingType = (
+    oldSigla: string,
+    newSigla: string,
+    newNome: string
+  ): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar embalagens.' };
+    }
+    const cleanSigla = sanitizeString(newSigla.toUpperCase(), BLUEPRINT_LIMITS.packagingSiglaMaxLength);
+    const cleanNome = sanitizeString(newNome || cleanSigla, BLUEPRINT_LIMITS.packagingNameMaxLength);
     if (!cleanSigla) {
-      return { success: false, message: 'A sigla não pode ser vazia.' };
+      return { success: false, message: 'A sigla da embalagem não pode ser vazia.' };
     }
-    if (oldSigla !== cleanSigla && packagingTypes.some((pt) => pt.sigla.toUpperCase() === cleanSigla)) {
-      return { success: false, message: `A sigla "${cleanSigla}" já está em uso.` };
+    if (
+      oldSigla.toUpperCase() !== cleanSigla &&
+      packagingTypes.some((p) => p.sigla.toUpperCase() === cleanSigla)
+    ) {
+      return { success: false, message: `Já existe um tipo de embalagem com a sigla "${cleanSigla}".` };
     }
 
-    const updated = packagingTypes.map((pt) =>
-      pt.sigla === oldSigla ? { sigla: cleanSigla, nome: cleanNome } : pt
-    );
-    setPackagingTypes(updated);
+    const targetDoc = packagingDocs.find((p) => p.sigla === oldSigla);
+    const affectedProducts = products.filter((p) => p.unidade === oldSigla);
+    const batch = writeBatch(db);
 
-    // Update products using oldSigla
-    let count = 0;
-    const updatedProducts = products.map((p) => {
-      if (p.unidade === oldSigla) {
-        count++;
-        return { ...p, unidade: cleanSigla };
-      }
-      return p;
+    if (targetDoc) {
+      batch.update(doc(db, 'packagingTypes', targetDoc.id), {
+        sigla: cleanSigla,
+        nome: cleanNome,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const pkid = sanitizeDocId(`pack_${cleanSigla}`, 'pack');
+      batch.set(doc(db, 'packagingTypes', pkid), {
+        id: pkid,
+        workspaceId: WORKSPACE_ID,
+        sigla: cleanSigla,
+        nome: cleanNome,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (oldSigla !== cleanSigla) {
+      affectedProducts.forEach((p) => {
+        batch.update(doc(db, 'products', p.id), {
+          unidade: cleanSigla,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    }
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, 'packagingTypes');
     });
-    if (count > 0) {
-      setProducts(updatedProducts);
-    }
 
     return {
       success: true,
-      message: `Embalagem atualizada para "${cleanNome}" (${cleanSigla})${count > 0 ? ` em ${count} produto(s)` : ''}!`,
+      message: `Tipo de embalagem atualizado para "${cleanSigla}"${
+        affectedProducts.length > 0 ? ` em ${affectedProducts.length} produto(s)` : ''
+      }!`,
     };
   };
 
   const removePackagingType = (sigla: string): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem gerenciar embalagens.' };
+    }
     if (packagingTypes.length <= 1) {
-      return { success: false, message: 'O sistema deve possuir pelo menos um tipo de embalagem.' };
+      return { success: false, message: 'O sistema deve manter pelo menos 1 tipo de embalagem ativo.' };
     }
 
-    const remaining = packagingTypes.filter((pt) => pt.sigla !== sigla);
-    setPackagingTypes(remaining);
+    const fallback = packagingTypes.find((p) => p.sigla !== sigla)?.sigla || 'UN';
+    const targetDoc = packagingDocs.find((p) => p.sigla === sigla);
+    const affectedProducts = products.filter((p) => p.unidade === sigla);
+    const batch = writeBatch(db);
 
-    // Reassign products to fallback
-    const fallback = remaining.find((pt) => pt.sigla === 'UN')?.sigla || remaining[0].sigla;
-    let count = 0;
-    const updatedProducts = products.map((p) => {
-      if (p.unidade === sigla) {
-        count++;
-        return { ...p, unidade: fallback };
-      }
-      return p;
+    if (targetDoc) {
+      batch.delete(doc(db, 'packagingTypes', targetDoc.id));
+    }
+
+    affectedProducts.forEach((p) => {
+      batch.update(doc(db, 'products', p.id), {
+        unidade: fallback,
+        updatedAt: serverTimestamp(),
+      });
     });
-    if (count > 0) {
-      setProducts(updatedProducts);
-    }
+
+    batch.commit().catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `packagingTypes/${targetDoc?.id || sigla}`);
+    });
 
     return {
       success: true,
-      message: `Embalagem "${sigla}" removida${count > 0 ? ` (${count} produto(s) atualizados para "${fallback}")` : ''}!`,
+      message:
+        affectedProducts.length > 0
+          ? `Embalagem "${sigla}" removida. ${affectedProducts.length} produto(s) atualizado(s) para "${fallback}".`
+          : `Tipo de embalagem "${sigla}" removido com sucesso!`,
     };
   };
 
-  const addUser = (username: string, pass: string, nivel: UserLevel): { success: boolean; message: string } => {
-    if (!currentUser || currentUser.nivel !== 2) {
-      return { success: false, message: 'Permissão negada. Apenas Administradores podem cadastrar novos usuários.' };
-    }
-    const cleanUser = username.trim();
-    if (!cleanUser || !pass) {
-      return { success: false, message: 'Informe nome de usuário e senha.' };
-    }
-    if (users.some((u) => u.username.toLowerCase() === cleanUser.toLowerCase())) {
-      return { success: false, message: 'Já existe um usuário com este nome.' };
-    }
-
-    const roleName: 'Administrador' | 'Operador' =
-      nivel === 2 ? 'Administrador' : 'Operador';
-    const newUser: UserAccount = {
-      username: cleanUser,
-      passwordHash: pass,
-      nivel,
-      roleName,
-      createdAt: getNowFormatted(),
+  // Users RBAC Management (Real Firebase Auth users in /users/{uid})
+  const addUser = (): { success: boolean; message: string } => {
+    return {
+      success: false,
+      message:
+        'Com o login Google na nuvem, novos membros apenas abrem o aplicativo e clicam em "Entrar com Google" para aparecerem nesta lista automaticamente.',
     };
-
-    setUsers([...users, newUser]);
-    return { success: true, message: `Usuário "${cleanUser}" cadastrado com perfil ${roleName}!` };
   };
 
-  const updateUserPassword = (username: string, newPass: string): { success: boolean; message: string } => {
-    if (!currentUser || (currentUser.username !== username && currentUser.nivel !== 2)) {
-      return { success: false, message: 'Permissão negada. Usuários Operadores não podem alterar a senha de outros usuários.' };
-    }
-    if (!newPass.trim()) return { success: false, message: 'A senha não pode ser vazia.' };
-    const updated = users.map((u) => (u.username === username ? { ...u, passwordHash: newPass } : u));
-    setUsers(updated);
-    return { success: true, message: `Senha do usuário ${username} alterada!` };
+  const updateUserPassword = (): { success: boolean; message: string } => {
+    return {
+      success: false,
+      message: 'As senhas são gerenciadas com segurança diretamente pela conta Google de cada usuário.',
+    };
   };
 
-  const updateUserLevel = (username: string, newLevel: UserLevel): { success: boolean; message: string } => {
-    if (!currentUser || currentUser.nivel !== 2) {
-      return { success: false, message: 'Permissão negada. Usuários Operadores não podem alterar o nível de outros usuários.' };
+  const updateUserLevel = (identifier: string, newLevel: UserLevel): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem alterar permissões.' };
     }
-    if (username.toLowerCase() === 'willian' && newLevel !== 2) {
-      return { success: false, message: 'O usuário Willian é o Administrador principal e não pode ter seu nível alterado.' };
+
+    const target = users.find((u) => u.uid === identifier || u.username === identifier);
+    if (!target || !target.uid) {
+      return { success: false, message: 'Usuário não encontrado.' };
     }
-    const roleName: 'Administrador' | 'Operador' =
-      newLevel === 2 ? 'Administrador' : 'Operador';
-    const updated = users.map((u) => (u.username === username ? { ...u, nivel: newLevel, roleName } : u));
-    setUsers(updated);
-    return { success: true, message: `Nível de ${username} atualizado para ${roleName}!` };
+    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
+      return { success: false, message: 'O Administrador Principal não pode ter seu nível alterado.' };
+    }
+    if (target.uid === currentUser?.uid) {
+      return { success: false, message: 'Você não pode alterar seu próprio nível de acesso.' };
+    }
+
+    const newRole = newLevel === 2 ? 'admin' : 'operator';
+    updateDoc(doc(db, 'users', target.uid), {
+      role: newRole,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `users/${target.uid}`);
+    });
+
+    return {
+      success: true,
+      message: `Permissão de "${target.username}" atualizada para ${
+        newLevel === 2 ? 'Administrador' : 'Operador'
+      }!`,
+    };
   };
 
-  const removeUser = (username: string): { success: boolean; message: string } => {
-    if (!currentUser || currentUser.nivel !== 2) {
-      return { success: false, message: 'Permissão negada. Usuários Operadores não podem excluir outros usuários.' };
+  const toggleUserActive = (uid: string, active: boolean): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem suspender ou reativar acessos.' };
     }
-    if (username.toLowerCase() === 'willian') {
-      return { success: false, message: 'O usuário Willian é o Administrador principal e não pode ser removido.' };
+
+    const target = users.find((u) => u.uid === uid);
+    if (!target) {
+      return { success: false, message: 'Usuário não encontrado.' };
     }
-    if (users.length <= 1) {
-      return { success: false, message: 'Não é possível remover o único usuário do sistema.' };
+    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
+      return { success: false, message: 'Não é possível suspender o Administrador Principal.' };
     }
-    if (currentUser?.username === username) {
-      return { success: false, message: 'Você não pode remover seu próprio usuário logado.' };
+    if (target.uid === currentUser?.uid) {
+      return { success: false, message: 'Você não pode suspender sua própria conta.' };
     }
-    setUsers(users.filter((u) => u.username !== username));
-    return { success: true, message: `Usuário "${username}" removido com sucesso!` };
+
+    updateDoc(doc(db, 'users', uid), {
+      active,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      reportAsyncError(err, OperationType.UPDATE, `users/${uid}`);
+    });
+
+    return {
+      success: true,
+      message: active
+        ? `Acesso de "${target.username}" reativado com sucesso!`
+        : `Acesso de "${target.username}" suspenso imediatamente.`,
+    };
   };
 
+  const removeUser = (identifier: string): { success: boolean; message: string } => {
+    if (!isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem remover usuários.' };
+    }
+
+    const target = users.find((u) => u.uid === identifier || u.username === identifier);
+    if (!target || !target.uid) {
+      return { success: false, message: 'Usuário não encontrado.' };
+    }
+    if ((target.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) {
+      return { success: false, message: 'Não é possível excluir o Administrador Principal.' };
+    }
+    if (target.uid === currentUser?.uid) {
+      return { success: false, message: 'Você não pode excluir o usuário logado atualmente.' };
+    }
+
+    deleteDoc(doc(db, 'users', target.uid)).catch((err) => {
+      reportAsyncError(err, OperationType.DELETE, `users/${target.uid}`);
+    });
+
+    return { success: true, message: `Registro de "${target.username}" removido.` };
+  };
+
+  // Backup Export / Import / Reset
   const exportBackupJson = (): string => {
-    // Schema of estoque.json with added categorias and embalagens
-    const estoqueArr = products.map((p) => [String(p.numero), p.nome, String(p.quantidade)]);
-    const historicoArr = movements.map((m) => [m.dataHora, String(m.numero), m.produto, m.tipo, m.quantidade]);
-
-    const backupObj = {
-      estoque: estoqueArr,
-      historico: historicoArr,
+    const payload = {
+      sistema: 'WL System - Estoque Galpão (Cloud Firestore)',
+      versao: '3.0',
+      exportadoEm: getNowFormatted(),
+      estoque: products.map((p) => [String(p.numero), p.nome, String(p.quantidade)]),
+      produtosDetalhados: products,
+      historico: movements.map((m) => [m.dataHora, String(m.numero), m.produto, m.tipo, m.quantidade]),
+      historicoDetalhado: movements,
       categorias: categories,
       embalagens: packagingTypes,
     };
-    return JSON.stringify(backupObj, null, 2);
+    return JSON.stringify(payload, null, 2);
   };
 
   const importBackupJson = (jsonString: string): { success: boolean; message: string } => {
+    if (!auth.currentUser || !isUserAdmin(currentUser)) {
+      return { success: false, message: 'Apenas administradores podem restaurar backups na nuvem.' };
+    }
+
     try {
       const parsed = JSON.parse(jsonString);
-      if (!parsed.estoque || !Array.isArray(parsed.estoque)) {
-        return { success: false, message: 'Formato inválido. Campo "estoque" não encontrado.' };
+      let importedProducts: StockProduct[] = [];
+      let importedMovements: StockMovement[] = [];
+      const nowStr = getNowFormatted();
+
+      if (Array.isArray(parsed.produtosDetalhados)) {
+        importedProducts = parsed.produtosDetalhados;
+      } else if (Array.isArray(parsed.estoque)) {
+        importedProducts = parsed.estoque.map((item: any, idx: number) => {
+          const numero = parseInt(item[0], 10) || idx + 1;
+          const nome = String(item[1] || '').toUpperCase();
+          const quantidade = parseFloat(item[2]) || 0;
+          return {
+            id: `prod_${numero}`,
+            numero,
+            nome,
+            quantidade,
+            estoqueMinimo: 15,
+            unidade: inferUnit(nome),
+            categoria: inferCategory(nome),
+            ultimaAtualizacao: nowStr,
+            inativo: false,
+          };
+        });
+      } else {
+        return { success: false, message: 'Arquivo JSON inválido: propriedade "estoque" não encontrada.' };
       }
 
-      const importedProducts: StockProduct[] = parsed.estoque.map((item: any[], idx: number) => {
-        const num = parseInt(item[0], 10) || idx + 1;
-        const nome = String(item[1] || '').trim().toUpperCase();
-        const qtd = parseInt(item[2], 10) || 0;
-        return {
-          id: `prod_imp_${num}_${Date.now()}`,
-          numero: num,
-          nome,
-          quantidade: qtd,
-          estoqueMinimo: 15,
-          unidade: inferUnit(nome),
-          categoria: inferCategory(nome),
-          ultimaAtualizacao: getNowFormatted(),
-        };
-      });
-
-      let importedMovements: StockMovement[] = [];
-      if (parsed.historico && Array.isArray(parsed.historico)) {
-        importedMovements = parsed.historico.map((m: any[], idx: number) => ({
-          id: `mov_imp_${idx}_${Date.now()}`,
-          dataHora: m[0] || getNowFormatted(),
-          numero: parseInt(m[1], 10) || 0,
-          produto: m[2] || '',
-          tipo: m[3] === 'Entrada' ? 'Entrada' : 'Saída',
-          quantidade: parseInt(m[4], 10) || 0,
+      if (Array.isArray(parsed.historicoDetalhado)) {
+        importedMovements = parsed.historicoDetalhado;
+      } else if (Array.isArray(parsed.historico)) {
+        importedMovements = parsed.historico.map((item: any, idx: number) => ({
+          id: `mov_${idx + 1}`,
+          dataHora: String(item[0] || ''),
+          numero: parseInt(item[1], 10) || 0,
+          produto: String(item[2] || ''),
+          tipo: item[3] === 'Entrada' ? 'Entrada' : 'Saída',
+          quantidade: Number(item[4]) || 1,
           usuario: 'Backup',
+          observacao: 'Importado via JSON',
         }));
       }
 
-      if (parsed.categorias && Array.isArray(parsed.categorias) && parsed.categorias.length > 0) {
-        setCategories(parsed.categorias);
-      }
+      const uid = auth.currentUser.uid;
+      const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
 
-      if (parsed.embalagens && Array.isArray(parsed.embalagens) && parsed.embalagens.length > 0) {
-        setPackagingTypes(parsed.embalagens);
-      }
+      // Delete existing products & movements
+      products.forEach((p) => operations.push((b) => b.delete(doc(db, 'products', p.id))));
+      movements.forEach((m) => operations.push((b) => b.delete(doc(db, 'movements', m.id))));
 
-      setProducts(importedProducts);
-      if (importedMovements.length > 0) {
-        setMovements(importedMovements);
-      }
-      setLastUpdatedTime(getNowFormatted());
+      const prodIdByNumber = new Map<number, string>();
+      importedProducts.forEach((p, idx) => {
+        const pid = sanitizeDocId(p.id || `prod_${p.numero || idx + 1}`, 'prod');
+        const num = Math.max(1, Math.floor(p.numero || idx + 1));
+        prodIdByNumber.set(num, pid);
+        operations.push((b) => {
+          b.set(doc(db, 'products', pid), {
+            id: pid,
+            workspaceId: WORKSPACE_ID,
+            numero: num,
+            nome: sanitizeString((p.nome || `PRODUTO ${num}`).toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
+            quantidade: clampQuantity(p.quantidade),
+            estoqueMinimo: clampQuantity(p.estoqueMinimo || 15),
+            unidade: sanitizeString(p.unidade || 'UN', BLUEPRINT_LIMITS.unitMaxLength),
+            categoria: sanitizeString(p.categoria || 'Outros', BLUEPRINT_LIMITS.categoryNameMaxLength),
+            ultimaAtualizacao: sanitizeString(p.ultimaAtualizacao || nowStr, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+            inativo: Boolean(p.inativo),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        });
+      });
+
+      importedMovements.forEach((m, idx) => {
+        const mid = sanitizeDocId(m.id || `mov_${idx + 1}_${Date.now().toString(36)}`, 'mov');
+        const num = Math.max(1, Math.floor(m.numero || 1));
+        const matchedProdId = prodIdByNumber.get(num);
+        const movPayload: Record<string, unknown> = {
+          id: mid,
+          workspaceId: WORKSPACE_ID,
+          dataHora: sanitizeString(m.dataHora || nowStr, BLUEPRINT_LIMITS.dateDisplayMaxLength),
+          numero: num,
+          produto: sanitizeString((m.produto || 'PRODUTO').toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
+          tipo: m.tipo === 'Saída' ? 'Saída' : 'Entrada',
+          quantidade: Math.max(1, clampQuantity(m.quantidade)),
+          usuario: sanitizeString(m.usuario || 'Backup', BLUEPRINT_LIMITS.usernameMaxLength),
+          userId: uid,
+          createdAt: serverTimestamp(),
+        };
+        if (matchedProdId) movPayload.productId = matchedProdId;
+        if (m.observacao) {
+          movPayload.observacao = sanitizeString(m.observacao, BLUEPRINT_LIMITS.observacaoMaxLength);
+        }
+        operations.push((b) => b.set(doc(db, 'movements', mid), movPayload));
+      });
+
+      (async () => {
+        try {
+          const CHUNK_SIZE = 350;
+          for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+            const batch = writeBatch(db);
+            operations.slice(i, i + CHUNK_SIZE).forEach((fn) => fn(batch));
+            await batch.commit();
+          }
+        } catch (err) {
+          reportAsyncError(err, OperationType.WRITE, 'products');
+        }
+      })();
 
       return {
         success: true,
-        message: `Backup importado com sucesso! ${importedProducts.length} produtos carregados.`,
+        message: `Backup importado na nuvem com sucesso! ${importedProducts.length} produtos sincronizados para todos os dispositivos.`,
       };
     } catch (e: any) {
       return { success: false, message: `Erro ao analisar JSON: ${e.message}` };
@@ -881,17 +1497,29 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const resetDataToInitial = () => {
-    setProducts(INITIAL_PRODUCTS);
-    setMovements(INITIAL_MOVEMENTS);
-    setUsers(INITIAL_USERS);
-    setCategories(INITIAL_CATEGORIES);
-    setPackagingTypes(INITIAL_PACKAGING_TYPES);
-    setLastUpdatedTime(getNowFormatted());
-    localStorage.removeItem(LS_PRODUCTS_KEY);
-    localStorage.removeItem(LS_MOVEMENTS_KEY);
-    localStorage.removeItem(LS_USERS_KEY);
-    localStorage.removeItem(LS_CATEGORIES_KEY);
-    localStorage.removeItem(LS_PACKAGING_KEY);
+    if (!auth.currentUser || !isUserAdmin(currentUser)) return;
+    const uid = auth.currentUser.uid;
+
+    (async () => {
+      try {
+        const deletes: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
+        products.forEach((p) => deletes.push((b) => b.delete(doc(db, 'products', p.id))));
+        movements.forEach((m) => deletes.push((b) => b.delete(doc(db, 'movements', m.id))));
+        categoryDocs.forEach((c) => deletes.push((b) => b.delete(doc(db, 'categories', c.id))));
+        packagingDocs.forEach((p) => deletes.push((b) => b.delete(doc(db, 'packagingTypes', p.id))));
+
+        const CHUNK_SIZE = 350;
+        for (let i = 0; i < deletes.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          deletes.slice(i, i + CHUNK_SIZE).forEach((fn) => fn(batch));
+          await batch.commit();
+        }
+
+        await seedInitialDataToFirestore(uid);
+      } catch (err) {
+        reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap');
+      }
+    })();
   };
 
   return (
@@ -901,10 +1529,14 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         movements,
         users,
         currentUser,
+        authReady,
+        isSyncing,
+        isAccessSuspended,
         categories,
         packagingTypes,
         stats,
         lastUpdatedTime,
+        signInWithGoogle,
         login,
         logout,
         registerMovement,
@@ -923,6 +1555,7 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         addUser,
         updateUserPassword,
         updateUserLevel,
+        toggleUserActive,
         removeUser,
         exportBackupJson,
         importBackupJson,

@@ -662,15 +662,9 @@ export function WLEstoqueApp() {
             {/* Left: DM Santos Logo */}
             <div className="w-32 shrink-0">
               <img
-                src="/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png"
+                src="/logo.png"
                 alt="WL System"
                 className="h-16 w-16 object-contain"
-                onError={(e) => {
-                  const target = e.target as HTMLImageElement;
-                  if (!target.src.includes('Emblema_circular_verde_e_amarelo_recortado_851a632b.png')) {
-                    target.src = '/public/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
-                  }
-                }}
               />
             </div>
 
@@ -1308,7 +1302,7 @@ export function WLEstoqueApp() {
               <div className="bg-[#2e7d32] text-white p-4 rounded-t-lg flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
                   <img
-                    src="/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png"
+                    src="/logo.png"
                     alt="WL System"
                     className="h-10 w-10 object-contain"
                   />

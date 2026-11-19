@@ -119,7 +119,7 @@ export const ReportsView: React.FC = () => {
         resolve(null);
       };
       img.onerror = () => resolve(null);
-      img.src = '/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
+      img.src = '/logo.png';
     });
   };
 
@@ -721,15 +721,9 @@ export const ReportsView: React.FC = () => {
             <div className="flex items-center gap-4">
               <div className="w-14 h-14 rounded-full bg-slate-900/80 p-0.5 border border-emerald-500/40 flex items-center justify-center shrink-0 shadow-md overflow-hidden aspect-square">
                 <img
-                  src={circularLogoUrl || '/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png'}
+                  src={circularLogoUrl || '/logo.png'}
                   alt="WL Logo"
                   className="w-full h-full object-contain filter drop-shadow-md aspect-square select-none"
-                  onError={(e) => {
-                    const target = e.target as HTMLImageElement;
-                    if (!target.src.includes('Emblema_circular_verde_e_amarelo_recortado_851a632b.png')) {
-                      target.src = '/assets/aistudio/Emblema_circular_verde_e_amarelo_recortado_851a632b.png';
-                    }
-                  }}
                 />
               </div>
               <div>

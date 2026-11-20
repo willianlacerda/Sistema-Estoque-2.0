@@ -93,7 +93,8 @@ interface StockContextType {
 
 const StockContext = createContext<StockContextType | undefined>(undefined);
 
-const LS_SESSION_KEY = 'wl_estoque_current_user_v3';
+const LEGACY_LS_SESSION_KEY = 'wl_estoque_current_user_v3';
+const SESSION_STORAGE_KEY = 'wl_estoque_session_user_v4';
 
 function getNowFormatted(): string {
   const now = new Date();
@@ -133,7 +134,9 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
     try {
-      const stored = localStorage.getItem(LS_SESSION_KEY);
+      // Remove legacy persistent localStorage session so closing the app always requires login
+      localStorage.removeItem(LEGACY_LS_SESSION_KEY);
+      const stored = sessionStorage.getItem(SESSION_STORAGE_KEY);
       if (stored) {
         const parsed: UserAccount = JSON.parse(stored);
         if (parsed && parsed.username) {
@@ -176,14 +179,15 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  // Persist current logged-in session locally on this device
+  // Keep active login only while the app/tab stays open (sessionStorage clears on close)
   useEffect(() => {
     try {
+      localStorage.removeItem(LEGACY_LS_SESSION_KEY);
       if (currentUser) {
-        localStorage.setItem(LS_SESSION_KEY, JSON.stringify(currentUser));
+        sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
         localStorage.setItem('wl_last_username', currentUser.username);
       } else {
-        localStorage.removeItem(LS_SESSION_KEY);
+        sessionStorage.removeItem(SESSION_STORAGE_KEY);
       }
     } catch (e) {
       console.error(e);

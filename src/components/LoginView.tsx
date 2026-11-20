@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useStock } from '../context/StockContext';
 import { Lock, User, ArrowRight, Eye, EyeOff } from 'lucide-react';
+import { PWAInstallButton } from './PWAInstallButton';
 
 export const LoginView: React.FC = () => {
   const { login } = useStock();
@@ -131,8 +132,11 @@ export const LoginView: React.FC = () => {
         </form>
       </div>
 
-      <div className="mt-6 text-center text-xs text-slate-400">
-        WL System · Sistema de Gestão de Galpão © {new Date().getFullYear()}
+      <div className="relative z-10 flex flex-col items-center">
+        <PWAInstallButton variant="login" />
+        <div className="mt-5 text-center text-xs text-slate-400">
+          WL System · Sistema de Gestão de Galpão © {new Date().getFullYear()}
+        </div>
       </div>
     </div>
   );

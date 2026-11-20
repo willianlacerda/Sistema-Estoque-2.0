@@ -2,6 +2,7 @@ import React from 'react';
 import { useStock } from '../context/StockContext';
 import { LogOut, ShieldCheck, Clock, Settings, Menu as MenuIcon } from 'lucide-react';
 import { SidebarTab } from './Sidebar';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface TopNavbarProps {
   activeTab: SidebarTab;
@@ -84,6 +85,9 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
               <Clock className="w-3.5 h-3.5 text-emerald-400" />
               <span>{lastUpdatedTime}</span>
             </div>
+
+            {/* In-App PWA Install Button */}
+            <PWAInstallButton variant="navbar" />
 
             {/* Shortcut to Settings (em desktop, pois no mobile já está na barra inferior) */}
             <button

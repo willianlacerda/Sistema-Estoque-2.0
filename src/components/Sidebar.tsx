@@ -12,6 +12,7 @@ import {
   X,
   FileSpreadsheet,
 } from 'lucide-react';
+import { PWAInstallButton } from './PWAInstallButton';
 
 export type SidebarTab = 'estoque' | 'historico' | 'cadastro' | 'relatorios' | 'configuracoes';
 
@@ -177,7 +178,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* User Profile Footer in Sidebar */}
       {currentUser && (
-        <div className="p-4 border-t border-slate-800 bg-[#0c1322]">
+        <div className="p-4 border-t border-slate-800 bg-[#0c1322] space-y-2.5">
+          <PWAInstallButton variant="sidebar" />
           <div className="flex items-center justify-between bg-slate-800/60 p-3 rounded-2xl border border-slate-700/60">
             <div className="flex items-center gap-2.5 overflow-hidden">
               <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center font-bold text-white text-sm shadow-inner shrink-0">

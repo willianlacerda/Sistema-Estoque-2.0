@@ -17,6 +17,7 @@ import { ReportsView } from './components/ReportsView';
 import { MovementModal } from './components/MovementModal';
 import { ProductFormModal } from './components/ProductFormModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { StockProduct, MovementType } from './types';
 import { Boxes, History, PackagePlus, FileSpreadsheet, Settings, Loader2, ShieldAlert, LogOut } from 'lucide-react';
 
@@ -258,6 +259,7 @@ export default function App() {
     <ErrorBoundary>
       <StockProvider>
         <MainApp />
+        <OfflineIndicator />
       </StockProvider>
     </ErrorBoundary>
   );

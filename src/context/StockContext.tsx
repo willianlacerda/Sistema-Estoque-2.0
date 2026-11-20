@@ -3,6 +3,7 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -309,6 +310,11 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         seeded: true,
         updatedAt: serverTimestamp(),
       });
+      b.set(doc(db, 'metadata', 'inventory_sync_20261120'), {
+        workspaceId: WORKSPACE_ID,
+        seeded: true,
+        updatedAt: serverTimestamp(),
+      });
     });
 
     const CHUNK_SIZE = 350;
@@ -319,7 +325,73 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  // 1. Seed Firestore once on first boot if database is empty, and subscribe to accounts live
+  // One-time cloud inventory update matching Relatório de Estoque (20/11/2026 17:07)
+  const syncInventorySnapshot20261120 = async () => {
+    const existingSnap = await getDocs(
+      query(collection(db, 'products'), where('workspaceId', '==', WORKSPACE_ID))
+    );
+    const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+    const targetIds = new Set(
+      INITIAL_PRODUCTS.map((p) => sanitizeDocId(p.id || `prod_${p.numero}`, 'prod'))
+    );
+
+    const operations: Array<(b: ReturnType<typeof writeBatch>) => void> = [];
+
+    INITIAL_PRODUCTS.forEach((p) => {
+      const pid = sanitizeDocId(p.id || `prod_${p.numero}`, 'prod');
+      const commonFields = {
+        numero: Math.max(1, Math.floor(p.numero)),
+        nome: sanitizeString(p.nome.toUpperCase(), BLUEPRINT_LIMITS.productNameMaxLength),
+        quantidade: clampQuantity(p.quantidade),
+        estoqueMinimo: clampQuantity(p.estoqueMinimo || 15),
+        unidade: sanitizeString(p.unidade || 'UN', BLUEPRINT_LIMITS.unitMaxLength),
+        categoria: sanitizeString(p.categoria || 'Outros', BLUEPRINT_LIMITS.categoryNameMaxLength),
+        ultimaAtualizacao: sanitizeString(p.ultimaAtualizacao || '20/11/2026 17:07', BLUEPRINT_LIMITS.dateDisplayMaxLength),
+        inativo: false,
+        updatedAt: serverTimestamp(),
+      };
+
+      if (existingIds.has(pid)) {
+        operations.push((b) => {
+          b.update(doc(db, 'products', pid), commonFields);
+        });
+      } else {
+        operations.push((b) => {
+          b.set(doc(db, 'products', pid), {
+            id: pid,
+            workspaceId: WORKSPACE_ID,
+            ...commonFields,
+            createdAt: serverTimestamp(),
+          });
+        });
+      }
+    });
+
+    existingSnap.docs.forEach((oldDoc) => {
+      if (!targetIds.has(oldDoc.id)) {
+        operations.push((b) => {
+          b.delete(doc(db, 'products', oldDoc.id));
+        });
+      }
+    });
+
+    operations.push((b) => {
+      b.set(doc(db, 'metadata', 'inventory_sync_20261120'), {
+        workspaceId: WORKSPACE_ID,
+        seeded: true,
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    const CHUNK_SIZE = 350;
+    for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      operations.slice(i, i + CHUNK_SIZE).forEach((fn) => fn(batch));
+      await batch.commit();
+    }
+  };
+
+  // 1. Seed Firestore once on first boot if database is empty, and apply one-time inventory snapshot sync
   useEffect(() => {
     if (!seedAttemptedRef.current) {
       seedAttemptedRef.current = true;
@@ -328,9 +400,14 @@ export const StockProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           const metaSnap = await getDoc(doc(db, 'metadata', 'bootstrap_v2'));
           if (!metaSnap.exists()) {
             await seedInitialDataToFirestore(true);
+          } else {
+            const syncSnap = await getDoc(doc(db, 'metadata', 'inventory_sync_20261120'));
+            if (!syncSnap.exists()) {
+              await syncInventorySnapshot20261120();
+            }
           }
         } catch (err) {
-          reportAsyncError(err, OperationType.WRITE, 'metadata/bootstrap_v2');
+          reportAsyncError(err, OperationType.WRITE, 'metadata/inventory_sync_20261120');
         }
       })();
     }
